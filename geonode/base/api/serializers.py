@@ -96,7 +96,10 @@ class ResourceBaseToRepresentationSerializerMixin(DynamicModelSerializer):
                 'url'
             ]
 
-            links = Link.objects.filter(resource_id=int(obj_id), link_type__in=['OGC:WMS', 'OGC:WFS', 'OGC:WCS', 'image'])
+            links = Link.objects.filter(
+                resource_id=int(obj_id),
+                link_type__in=['OGC:WMS', 'OGC:WFS', 'OGC:WCS', 'image', 'metadata']
+            )
             for lnk in links:
                 formatted_link = model_to_dict(lnk, fields=link_fields)
                 dehydrated.append(formatted_link)
@@ -215,8 +218,12 @@ class EmbedUrlField(DynamicComputedField):
         super().__init__(**kwargs)
 
     def get_attribute(self, instance):
-        _instance = instance.get_real_instance()
-        if hasattr(_instance, 'embed_url') and _instance.embed_url != NotImplemented:
+        try:
+            _instance = instance.get_real_instance()
+        except Exception as e:
+            logger.exception(e)
+            _instance = None
+        if _instance and hasattr(_instance, 'embed_url') and _instance.embed_url != NotImplemented:
             return build_absolute_uri(_instance.embed_url)
         else:
             return ""

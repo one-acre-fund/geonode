@@ -897,23 +897,15 @@ class MapResource(CommonModelApi):
             formatted_obj['online'] = True
 
             # get map layers
-            map_datasets = obj.datasets
+            map_datasets = obj.maplayers
             formatted_datasets = []
             map_dataset_fields = [
                 'id',
-                'stack_order',
-                'format',
                 'name',
-                'opacity',
-                'group',
-                'visibility',
-                'transparent',
                 'ows_url',
-                'dataset_params',
-                'source_params',
                 'local'
             ]
-            for layer in map_datasets:
+            for layer in map_datasets.iterator():
                 formatted_map_dataset = model_to_dict(
                     layer, fields=map_dataset_fields)
                 formatted_datasets.append(formatted_map_dataset)
