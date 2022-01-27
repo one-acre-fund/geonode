@@ -40,7 +40,6 @@ from geonode.maps.api.serializers import MapLayerSerializer, MapSerializer
 from geonode.maps.contants import _PERMISSION_MSG_SAVE
 from geonode.maps.models import Map
 from geonode.maps.signals import map_changed_signal
-from geonode.maps.utils.thumbnail import handle_map_thumbnail
 from geonode.monitoring.models import EventType
 from geonode.resource.manager import resource_manager
 from geonode.utils import resolve_object
@@ -119,12 +118,14 @@ class MapViewSet(DynamicModelViewSet):
             uuid=str(uuid4()),
         )
 
-        # thumbnail, events and resouce routines
+        # events and resouce routines
         self._post_change_routines(
             instance=instance,
             create_action_perfomed=True,
             additional_data=post_creation_data,
         )
+        # Handle thumbnail generation
+        resource_manager.set_thumbnail(instance.uuid, instance=instance, overwrite=False)
 
     def perform_update(self, serializer):
         # Check instance permissions with resolve_object
@@ -163,6 +164,3 @@ class MapViewSet(DynamicModelViewSet):
         register_event(self.request, event_type, instance)
         # Step 3: Resource Manager
         resource_manager.update(instance.uuid, instance=instance, notify=True)
-        resource_manager.set_thumbnail(instance.uuid, instance=instance, overwrite=False)
-        # Step 4: Handle Thumbnail
-        handle_map_thumbnail(thumbnail=additional_data["thumbnail"], map_obj=instance)

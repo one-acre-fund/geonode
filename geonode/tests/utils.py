@@ -176,6 +176,7 @@ class Client(DjangoTestClient):
                 message = ex.message[ex.message.index(':') + 2:]
             else:
                 message = str(ex)
+            message = f"{message} (Content: {response.content.decode()}"
             raise HTTPError(url, response.status_code, message, response.headers, None)
 
         logger.error(f" make_request ----------> response: {response}")
@@ -309,8 +310,7 @@ def get_web_page(url, username=None, password=None, login_url=None):
     try:
         pagehandle = urlopen(url)
     except HTTPError as e:
-        msg = ('The server couldn\'t fulfill the request. '
-               'Error code: %s' % e.status_code)
+        msg = f'The server couldn\'t fulfill the request. Error code: {e.status_code}'
         e.args = (msg,)
         raise
     except URLError as e:
