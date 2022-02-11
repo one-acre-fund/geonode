@@ -21,6 +21,7 @@ import os
 import re
 import html
 import math
+import shutil
 import logging
 import traceback
 from sequences.models import Sequence
@@ -71,6 +72,7 @@ from geonode.utils import (
 from geonode.thumbs.utils import (
     MISSING_THUMB,
     thumb_size,
+    remove_thumbs,
     get_unique_upload_path)
 from geonode.groups.models import GroupProfile
 from geonode.security.utils import get_visible_resources, get_geoapp_subtypes
@@ -87,6 +89,7 @@ from geonode.people.enumerations import ROLE_VALUES
 
 from urllib.parse import urlsplit, urljoin
 from geonode.storage.manager import storage_manager
+from geonode.upload.files import ALLOWED_EXTENSIONS
 
 logger = logging.getLogger(__name__)
 
@@ -542,7 +545,7 @@ class ThesaurusKeywordLabel(models.Model):
     """
 
     # read from the RDF file
-    lang = models.CharField(max_length=3)
+    lang = models.CharField(max_length=10)
     # read from the RDF file
     label = models.CharField(max_length=255)
     # note  = models.CharField(max_length=511)
@@ -606,7 +609,7 @@ class ThesaurusLabel(models.Model):
     Contains localized version of the thesaurus title
     """
     # read from the RDF file
-    lang = models.CharField(max_length=3)
+    lang = models.CharField(max_length=10)
     # read from the RDF file
     label = models.CharField(max_length=255)
 
@@ -639,18 +642,18 @@ class ResourceBaseManager(PolymorphicManager):
 
     @staticmethod
     def upload_files(resource_id, files, force=False):
+        """Update the ResourceBase model"""
         try:
             out = []
             for f in files:
-                if os.path.isfile(f) and os.path.exists(f):
-
+                if force:
+                    out.append(f)
+                elif os.path.isfile(f) and os.path.exists(f):
                     with open(f, 'rb') as ff:
                         folder = os.path.basename(os.path.dirname(f))
                         filename = os.path.basename(f)
                         file_uploaded_path = storage_manager.save(f'{folder}/{filename}', ff)
                         out.append(storage_manager.path(file_uploaded_path))
-                elif force:
-                    out.append(f)
 
             # making an update instead of save in order to avoid others
             # signal like post_save and commiunication with geoserver
@@ -658,6 +661,52 @@ class ResourceBaseManager(PolymorphicManager):
             return out
         except Exception as e:
             logger.exception(e)
+
+    @staticmethod
+    def cleanup_uploaded_files(resource_id):
+        """Remove uploaded files, if any"""
+        if ResourceBase.objects.filter(id=resource_id).exists():
+            _resource = ResourceBase.objects.filter(id=resource_id).get()
+            _uploaded_folder = None
+            if _resource.files:
+                for _file in _resource.files:
+                    try:
+                        if storage_manager.exists(_file):
+                            if not _uploaded_folder:
+                                _uploaded_folder = os.path.split(storage_manager.path(_file))[0]
+                            storage_manager.delete(_file)
+                    except Exception as e:
+                        logger.warning(e)
+                try:
+                    if _uploaded_folder and storage_manager.exists(_uploaded_folder):
+                        storage_manager.delete(_uploaded_folder)
+                except Exception as e:
+                    logger.warning(e)
+
+                # Do we want to delete the files also from the resource?
+                ResourceBase.objects.filter(id=resource_id).update(files={})
+
+            # Remove generated thumbnails, if any
+            filename = f"{_resource.get_real_instance().resource_type}-{_resource.get_real_instance().uuid}"
+            remove_thumbs(filename)
+
+            # Remove the uploaded sessions, if any
+            try:
+                if 'geonode.upload' in settings.INSTALLED_APPS:
+                    from geonode.upload.models import Upload
+                    # Need to call delete one by one in order to invoke the
+                    #  'delete' overridden method
+                    for upload in Upload.objects.filter(resource_id=_resource.get_real_instance().id):
+                        try:
+                            if upload.upload_dir:
+                                if storage_manager.exists(upload.upload_dir):
+                                    storage_manager.delete(upload.upload_dir)
+                                elif os.path.exists(upload.upload_dir):
+                                    shutil.rmtree(upload.upload_dir, ignore_errors=True)
+                        finally:
+                            upload.delete()
+            except Exception as e:
+                logger.exception(e)
 
 
 class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
@@ -723,6 +772,8 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
     data_quality_statement_help_text = _(
         'general explanation of the data producer\'s knowledge about the lineage of a'
         ' dataset')
+    extra_metadata_help_text = _(
+        'Additional metadata, must be in format [ {"metadata_key": "metadata_value"}, {"metadata_key": "metadata_value"} ]')
     # internal fields
     uuid = models.CharField(max_length=36)
     title = models.CharField(_('title'), max_length=255, help_text=_(
@@ -1014,6 +1065,13 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
 
     subtype = models.CharField(max_length=128, null=True, blank=True)
 
+    metadata = models.ManyToManyField(
+        "ExtraMetadata",
+        verbose_name=_('Extra Metadata'),
+        null=True,
+        blank=True,
+        help_text=extra_metadata_help_text)
+
     objects = ResourceBaseManager()
 
     class Meta:
@@ -1059,6 +1117,17 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
             "anonymous": VIEW_PERMISSIONS,
             "default": OWNER_PERMISSIONS,
             groups_settings.REGISTERED_MEMBERS_GROUP_NAME: OWNER_PERMISSIONS
+        }
+
+    @classproperty
+    def compact_permission_labels(cls):
+        return {
+            "none": _("None"),
+            "view": _("View"),
+            "download": _("Download"),
+            "edit": _("Edit"),
+            "manage": _("Manage"),
+            "owner": _("Owner")
         }
 
     @property
@@ -1369,6 +1438,14 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
             return False
         except Exception:
             return False
+
+    @property
+    def is_copyable(self):
+        from geonode.geoserver.helpers import select_relevant_files
+        if self.resource_type == 'dataset':
+            allowed_file = select_relevant_files(ALLOWED_EXTENSIONS, self.files)
+            return len(allowed_file) != 0
+        return True
 
     def keyword_list(self):
         return [kw.name for kw in self.keywords.all()]
@@ -2038,3 +2115,12 @@ def rating_post_save(instance, *args, **kwargs):
 
 
 signals.post_save.connect(rating_post_save, sender=OverallRating)
+
+
+class ExtraMetadata(models.Model):
+    resource = models.ForeignKey(
+        ResourceBase,
+        null=False,
+        blank=False,
+        on_delete=models.CASCADE)
+    metadata = JSONField(null=True, default=dict, blank=True)

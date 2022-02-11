@@ -48,6 +48,7 @@ class SizeRestrictedFileField(forms.FileField):
     Same as FileField, but checks file max_size based on the value stored on `field_slug`.
         * field_slug - a slug indicating the database object from where the max_size will be retrieved.
     """
+
     def __init__(self, *args, **kwargs):
         self.field_slug = kwargs.pop("field_slug")
         super(SizeRestrictedFileField, self).__init__(*args, **kwargs)
@@ -180,7 +181,7 @@ class DocumentCreateForm(TranslationModelForm, DocumentFormMixin):
             attrs={
                 'name': 'permissions',
                 'id': 'permissions'}),
-        required=True)
+        required=False)
 
     links = forms.MultipleChoiceField(
         label=_("Link to"),
@@ -208,6 +209,9 @@ class DocumentCreateForm(TranslationModelForm, DocumentFormMixin):
         Ensures the JSON field is JSON.
         """
         permissions = self.cleaned_data['permissions']
+
+        if not self.fields['permissions'].required and (permissions is None or permissions == ''):
+            return None
 
         try:
             return json.loads(permissions)

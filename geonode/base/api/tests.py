@@ -20,6 +20,8 @@ import sys
 import json
 import logging
 import re
+import os
+import gisdata
 
 from PIL import Image
 from io import BytesIO
@@ -36,16 +38,19 @@ from django.contrib.auth import get_user_model
 from rest_framework.test import APITestCase
 
 from guardian.shortcuts import get_anonymous_user
+from geonode.tests.base import GeoNodeBaseTestSupport
 
 from geonode.base import enumerations
 from geonode.groups.models import GroupProfile
 from geonode.thumbs.exceptions import ThumbnailError
+from geonode.layers.utils import get_files
 from geonode.base.models import (
     HierarchicalKeyword,
     Region,
     ResourceBase,
     TopicCategory,
     ThesaurusKeyword,
+    ExtraMetadata
 )
 
 from geonode.layers.models import Dataset
@@ -53,7 +58,7 @@ from geonode.favorite.models import Favorite
 from geonode.documents.models import Document
 from geonode.utils import build_absolute_uri
 from geonode.resource.api.tasks import ExecutionRequest
-from geonode.base.populate_test_data import create_models
+from geonode.base.populate_test_data import create_models, create_single_dataset
 from geonode.security.utils import get_resources_with_perms
 
 logger = logging.getLogger(__name__)
@@ -243,6 +248,7 @@ class BaseApiTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.data), 5)
         self.assertEqual(response.data['total'], 26)
+        response.data['resources'][0].get('executions')
         # Pagination
         self.assertEqual(len(response.data['resources']), 10)
         logger.debug(response.data)
@@ -325,6 +331,37 @@ class BaseApiTests(APITestCase):
         self.assertTrue(self.client.login(username='norman', password='norman'))
         response = self.client.get(f"{url}/{resource.id}/", format='json')
         self.assertFalse('change_resourcebase' in list(response.data['resource']['perms']))
+        # Check executions are returned when deffered
+        # all resources
+        response = self.client.get(f'{url}?include[]=executions', format='json')
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNotNone(response.data['resources'][0].get('executions'))
+        # specific resource
+        exec_req = ExecutionRequest.objects.create(
+            user=resource.owner,
+            func_name='test',
+            geonode_resource=resource,
+            input_params={
+                "uuid": resource.uuid,
+                "owner": resource.owner.username,
+                "resource_type": resource.resource_type,
+                "defaults": f"{{\"owner\":\"{resource.owner.username}\"}}"
+            }
+        )
+        expected_executions_results = [{
+            'user': exec_req.user.username,
+            'status': exec_req.status,
+            'func_name': exec_req.func_name,
+            'created': exec_req.created,
+            'finished': exec_req.finished,
+            'last_updated': exec_req.last_updated,
+            'input_params': exec_req.input_params,
+            'output_params': exec_req.output_params
+        }]
+        response = self.client.get(f'{url}/{resource.id}?include[]=executions', format='json')
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNotNone(response.data['resource'].get('executions'))
+        self.assertEqual(response.data['resource'].get('executions'), expected_executions_results)
 
         # test 'tkeywords'
         try:
@@ -937,23 +974,66 @@ class BaseApiTests(APITestCase):
                 },
                 "compact": {
                     "anonymous": [
-                        "none",
-                        "view",
-                        "download"
+                        {
+                            "name": "none",
+                            "label": "None"
+                        },
+                        {
+                            "name": "view",
+                            "label": "View"
+                        },
+                        {
+                            "name": "download",
+                            "label": "Download"
+                        }
                     ],
                     "default": [
-                        "view",
-                        "download",
-                        "edit",
-                        "manage",
-                        "owner"
+                        {
+                            "name": "view",
+                            "label": "View"
+                        },
+                        {
+                            "name": "download",
+                            "label": "Download"
+                        },
+                        {
+                            "name": "edit",
+                            "label": "Edit"
+                        },
+                        {
+                            "name": "manage",
+                            "label": "Manage"
+                        },
+                        {
+                            "name": "owner",
+                            "label": "Owner"
+                        },
+                        {
+                            "name": "owner",
+                            "label": "Owner"
+                        }
                     ],
                     "registered-members": [
-                        "none",
-                        "view",
-                        "download",
-                        "edit",
-                        "manage"
+                        {
+                            "name": "none",
+                            "label": "None"
+                        },
+                        {
+                            "name": "view",
+                            "label": "View"
+                        },
+                        {
+                            "name": "download",
+                            "label": "Download"
+                        },
+                        {
+                            "name": "edit",
+                            "label": "Edit"
+                        },
+                        {
+                            "name": "manage",
+                            "label": "Manage"
+                        }
                     ]
                 }
             }
@@ -987,23 +1067,66 @@ class BaseApiTests(APITestCase):
                 },
                 "compact": {
                     "anonymous": [
-                        "none",
-                        "view",
-                        "download"
+                        {
+                            "name": "none",
+                            "label": "None"
+                        },
+                        {
+                            "name": "view",
+                            "label": "View Metadata"
+                        },
+                        {
+                            "name": "download",
+                            "label": "View and Download"
+                        }
                     ],
                     "default": [
-                        "view",
-                        "download",
-                        "edit",
-                        "manage",
-                        "owner"
+                        {
+                            "name": "view",
+                            "label": "View Metadata"
+                        },
+                        {
+                            "name": "download",
+                            "label": "View and Download"
+                        },
+                        {
+                            "name": "edit",
+                            "label": "Edit"
+                        },
+                        {
+                            "name": "manage",
+                            "label": "Manage"
+                        },
+                        {
+                            "name": "owner",
+                            "label": "Owner"
+                        },
+                        {
+                            "name": "owner",
+                            "label": "Owner"
+                        }
                     ],
                     "registered-members": [
-                        "none",
-                        "view",
-                        "download",
-                        "edit",
-                        "manage"
+                        {
+                            "name": "none",
+                            "label": "None"
+                        },
+                        {
+                            "name": "view",
+                            "label": "View Metadata"
+                        },
+                        {
+                            "name": "download",
+                            "label": "View and Download"
+                        },
+                        {
+                            "name": "edit",
+                            "label": "Edit"
+                        },
+                        {
+                            "name": "manage",
+                            "label": "Manage"
+                        }
                     ]
                 }
             }
@@ -1034,20 +1157,54 @@ class BaseApiTests(APITestCase):
                 },
                 "compact": {
                     "anonymous": [
-                        "none",
-                        "view",
+                        {
+                            "name": "none",
+                            "label": "None"
+                        },
+                        {
+                            "name": "view",
+                            "label": "View"
+                        }
                     ],
                     "default": [
-                        "view",
-                        "edit",
-                        "manage",
-                        "owner"
+                        {
+                            "name": "view",
+                            "label": "View"
+                        },
+                        {
+                            "name": "edit",
+                            "label": "Edit"
+                        },
+                        {
+                            "name": "manage",
+                            "label": "Manage"
+                        },
+                        {
+                            "name": "owner",
+                            "label": "Owner"
+                        },
+                        {
+                            "name": "owner",
+                            "label": "Owner"
+                        }
                     ],
                     "registered-members": [
-                        "none",
-                        "view",
-                        "edit",
-                        "manage"
+                        {
+                            "name": "none",
+                            "label": "None"
+                        },
+                        {
+                            "name": "view",
+                            "label": "View"
+                        },
+                        {
+                            "name": "edit",
+                            "label": "Edit"
+                        },
+                        {
+                            "name": "manage",
+                            "label": "Manage"
+                        }
                     ]
                 }
             }
@@ -1661,3 +1818,120 @@ class BaseApiTests(APITestCase):
                 ]
             }
         )
+
+    def test_resource_service_copy(self):
+        files = os.path.join(gisdata.GOOD_DATA, "vector/san_andres_y_providencia_water.shp")
+        files_as_dict, _ = get_files(files)
+        resource = Dataset.objects.create(
+            owner=get_user_model().objects.get(username='admin'),
+            name='test_copy',
+            store='geonode_data',
+            subtype="vector",
+            alternate="geonode:test_copy",
+            uuid=str(uuid1()),
+            files=list(files_as_dict.values())
+        )
+        bobby = get_user_model().objects.get(username='bobby')
+        copy_url = reverse('base-resources-resource-service-copy', kwargs={'pk': resource.pk})
+        response = self.client.put(copy_url, data={'title': 'cloned_resource'})
+        self.assertEqual(response.status_code, 403)
+        # set perms to enable user clone resource
+        self.assertTrue(self.client.login(username="admin", password="admin"))
+        perm_spec = {
+            'users': [
+                {
+                    'id': bobby.id,
+                    'username': bobby.username,
+                    'first_name': bobby.first_name,
+                    'last_name': bobby.last_name,
+                    'avatar': '',
+                    'permissions': 'manage'
+                }
+            ]
+        }
+        set_perms_url = urljoin(f"{reverse('base-resources-detail', kwargs={'pk': resource.pk})}/", 'permissions')
+        data = f"uuid={resource.uuid}&permissions={json.dumps(perm_spec)}"
+        response = self.client.patch(set_perms_url, data=data, content_type='application/x-www-form-urlencoded')
+        self.assertEqual(response.status_code, 200)
+        # clone resource
+        self.assertTrue(self.client.login(username="bobby", password="bob"))
+        response = self.client.put(copy_url)
+        self.assertEqual(response.status_code, 200)
+        cloned_resource = Dataset.objects.last()
+        self.assertEqual(cloned_resource.owner.username, 'bobby')
+        # clone dataset with invalid file
+        resource.files = ['/path/invalid_file.wrong']
+        resource.save()
+        response = self.client.put(copy_url)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['message'], 'Resource can not be cloned.')
+        # clone dataset with no files
+        resource.files = []
+        resource.save()
+        response = self.client.put(copy_url)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['message'], 'Resource can not be cloned.')
+        # clean
+        resource.delete()
+        cloned_resource.delete()
+
+
+class TestExtraMetadataBaseApi(GeoNodeBaseTestSupport):
+    def setUp(self):
+        self.layer = create_single_dataset('single_layer')
+        self.metadata = {
+            "filter_header": "Foo Filter header",
+            "field_name": "metadata-name",
+            "field_label": "this is the help text",
+            "field_value": "foo"
+        }
+        m = ExtraMetadata.objects.create(
+            resource=self.layer,
+            metadata=self.metadata
+        )
+        self.layer.metadata.add(m)
+        self.mdata = ExtraMetadata.objects.first()
+
+    def test_get_will_return_the_list_of_extra_metadata(self):
+        self.client.login(username="admin", password="admin")
+        url = reverse('base-resources-extra-metadata', args=[self.layer.id])
+        response = self.client.get(url, content_type='application/json')
+        self.assertTrue(200, response.status_code)
+        expected = [
+            {**{"id": self.mdata.id}, **self.metadata}
+        ]
+        self.assertEqual(expected, response.json())
+
+    def test_put_will_update_the_whole_metadata(self):
+        self.client.login(username="admin", password="admin")
+        url = reverse('base-resources-extra-metadata', args=[self.layer.id])
+        input_metadata = {
+            "id": self.mdata.id,
+            "filter_header": "Foo Filter header",
+            "field_name": "metadata-updated",
+            "field_label": "this is the help text",
+            "field_value": "foo"
+        }
+        response = self.client.put(url, data=[input_metadata], content_type='application/json')
+        self.assertTrue(200, response.status_code)
+        self.assertEqual([input_metadata], response.json())
+
+    def test_post_will_add_new_metadata(self):
+        self.client.login(username="admin", password="admin")
+        url = reverse('base-resources-extra-metadata', args=[self.layer.id])
+        input_metadata = {
+            "filter_header": "Foo Filter header",
+            "field_name": "metadata-updated",
+            "field_label": "this is the help text",
+            "field_value": "foo"
+        }
+        response = self.client.post(url, data=[input_metadata], content_type='application/json')
+        self.assertTrue(201, response.status_code)
+        self.assertEqual(2, len(response.json()))
+
+    def test_delete_will_delete_single_metadata(self):
+        self.client.login(username="admin", password="admin")
+        url = reverse('base-resources-extra-metadata', args=[self.layer.id])
+        response = self.client.delete(url, data=[self.mdata.id], content_type='application/json')
+        self.assertTrue(200, response.status_code)
+        self.assertEqual([], response.json())

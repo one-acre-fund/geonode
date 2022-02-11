@@ -60,7 +60,7 @@ from rest_framework.authentication import SessionAuthentication, BasicAuthentica
 from geonode.maps.models import Map
 from geonode.layers.models import Dataset
 from geonode.favorite.models import Favorite
-from geonode.base.models import Configuration
+from geonode.base.models import Configuration, ExtraMetadata
 from geonode.thumbs.exceptions import ThumbnailError
 from geonode.thumbs.thumbnails import create_thumbnail
 from geonode.thumbs.utils import _decode_base64, BASE64_PATTERN
@@ -101,8 +101,10 @@ from .serializers import (
     TopicCategorySerializer,
     RegionSerializer,
     ThesaurusKeywordSerializer,
+    ExtraMetadataSerializer
 )
 from .pagination import GeoNodeApiPagination
+from geonode.base.utils import validate_extra_metadata
 
 import logging
 
@@ -390,12 +392,18 @@ class ResourceBaseViewSet(DynamicModelViewSet):
     @action(detail=False, methods=['get'])
     def resource_types(self, request):
 
-        def _to_compact_perms_list(allowed_perms: dict, resource_type: str, resource_subtype: str) -> list:
+        def _to_compact_perms_list(allowed_perms: dict, resource_type: str, resource_subtype: str, compact_perms_labels: dict = {}) -> list:
             _compact_perms_list = {}
             for _k, _v in allowed_perms.items():
                 _is_owner = _k not in ["anonymous", groups_settings.REGISTERED_MEMBERS_GROUP_NAME]
                 _is_none_allowed = not _is_owner
-                _compact_perms_list[_k] = get_compact_perms_list(_v, resource_type, resource_subtype, _is_owner, _is_none_allowed)
+                _compact_perms_list[_k] = get_compact_perms_list(
+                    _v,
+                    resource_type,
+                    resource_subtype,
+                    _is_owner,
+                    _is_none_allowed,
+                    compact_perms_labels)
             return _compact_perms_list
 
         resource_types = []
@@ -408,7 +416,8 @@ class ResourceBaseViewSet(DynamicModelViewSet):
                         _types.append(_m.__name__.lower())
                         _allowed_perms[_m.__name__.lower()] = {
                             "perms": _m.allowed_permissions,
-                            "compact": _to_compact_perms_list(_m.allowed_permissions, _m.__name__.lower(), _m.__name__.lower())
+                            "compact": _to_compact_perms_list(
+                                _m.allowed_permissions, _m.__name__.lower(), _m.__name__.lower(), _m.compact_permission_labels)
                         }
 
         if settings.GEONODE_APPS_ENABLE and 'geoapp' in _types:
@@ -420,12 +429,15 @@ class ResourceBaseViewSet(DynamicModelViewSet):
                 geoapp_types = [x for x in GeoApp.objects.values_list('resource_type', flat=True).all().distinct()]
                 _types += geoapp_types
 
-            if hasattr(settings, 'CLIENT_APP_ALLOWED_PERMS') and settings.CLIENT_APP_ALLOWED_PERMS:
-                for _type in settings.CLIENT_APP_ALLOWED_PERMS:
+            if hasattr(settings, 'CLIENT_APP_ALLOWED_PERMS_LIST') and settings.CLIENT_APP_ALLOWED_PERMS_LIST:
+                for _type in settings.CLIENT_APP_ALLOWED_PERMS_LIST:
                     for _type_name, _type_perms in _type.items():
+                        _compact_permission_labels = {}
+                        if hasattr(settings, 'CLIENT_APP_COMPACT_PERM_LABELS'):
+                            _compact_permission_labels = settings.CLIENT_APP_COMPACT_PERM_LABELS.get(_type_name, {})
                         _allowed_perms[_type_name] = {
                             "perms": _type_perms,
-                            "compact": _to_compact_perms_list(_type_perms, _type_name, _type_name)
+                            "compact": _to_compact_perms_list(_type_perms, _type_name, _type_name, _compact_permission_labels)
                         }
             else:
                 from geonode.geoapps.models import GeoApp
@@ -433,7 +445,8 @@ class ResourceBaseViewSet(DynamicModelViewSet):
                     if hasattr(_m, 'resource_type') and _m.resource_type and _m.resource_type not in _allowed_perms:
                         _allowed_perms[_m.resource_type] = {
                             "perms": _m.allowed_permissions,
-                            "compact": _to_compact_perms_list(_m.allowed_permissions, _m.resource_type, _m.subtype)
+                            "compact": _to_compact_perms_list(
+                                _m.allowed_permissions, _m.resource_type, _m.subtype, _m.compact_permission_labels)
                         }
 
         for _type in _types:
@@ -550,6 +563,7 @@ class ResourceBaseViewSet(DynamicModelViewSet):
                 _exec_request = ExecutionRequest.objects.create(
                     user=request.user,
                     func_name='remove_permissions',
+                    geonode_resource=resource,
                     input_params={
                         "uuid": request_params.get('uuid', resource.uuid)
                     }
@@ -560,6 +574,7 @@ class ResourceBaseViewSet(DynamicModelViewSet):
                 _exec_request = ExecutionRequest.objects.create(
                     user=request.user,
                     func_name='set_permissions',
+                    geonode_resource=resource,
                     input_params={
                         "uuid": request_params.get('uuid', resource.uuid),
                         "owner": request_params.get('owner', resource.owner.username),
@@ -575,6 +590,7 @@ class ResourceBaseViewSet(DynamicModelViewSet):
                 _exec_request = ExecutionRequest.objects.create(
                     user=request.user,
                     func_name='set_permissions',
+                    geonode_resource=resource,
                     input_params={
                         "uuid": request_params.get('uuid', resource.uuid),
                         "owner": request_params.get('owner', resource.owner.username),
@@ -717,11 +733,14 @@ class ResourceBaseViewSet(DynamicModelViewSet):
             return Response(status=status.HTTP_403_FORBIDDEN)
         try:
             request_params = QueryDict(request.body, mutable=True)
+            uuid = request_params.get('uuid', str(uuid1()))
+            resource_filter = ResourceBase.objects.filter(uuid=uuid)
             _exec_request = ExecutionRequest.objects.create(
                 user=request.user,
                 func_name='ingest',
+                geonode_resource=resource_filter.get() if resource_filter.exists() else None,
                 input_params={
-                    "uuid": request_params.get('uuid', str(uuid1())),
+                    "uuid": uuid,
                     "files": request_params.get('files', '[]'),
                     "resource_type": resource_type,
                     "defaults": request_params.get('defaults', f"{{\"owner\":\"{request.user.username}\"}}")
@@ -810,11 +829,15 @@ class ResourceBaseViewSet(DynamicModelViewSet):
             return Response(status=status.HTTP_403_FORBIDDEN)
         try:
             request_params = QueryDict(request.body, mutable=True)
+            uuid = request_params.get('uuid', str(uuid1()))
+            resource_filter = ResourceBase.objects.filter(uuid=uuid)
+
             _exec_request = ExecutionRequest.objects.create(
                 user=request.user,
                 func_name='create',
+                geonode_resource=resource_filter.get() if resource_filter.exists() else None,
                 input_params={
-                    "uuid": request_params.get('uuid', str(uuid1())),
+                    "uuid": uuid,
                     "resource_type": resource_type,
                     "defaults": request_params.get('defaults', f"{{\"owner\":\"{request.user.username}\"}}")
                 }
@@ -893,6 +916,7 @@ class ResourceBaseViewSet(DynamicModelViewSet):
             _exec_request = ExecutionRequest.objects.create(
                 user=request.user,
                 func_name='delete',
+                geonode_resource=resource,
                 input_params={
                     "uuid": resource.uuid
                 }
@@ -999,6 +1023,7 @@ class ResourceBaseViewSet(DynamicModelViewSet):
             _exec_request = ExecutionRequest.objects.create(
                 user=request.user,
                 func_name='update',
+                geonode_resource=resource,
                 input_params={
                     "uuid": request_params.get('uuid', resource.uuid),
                     "xml_file": request_params.get('xml_file', None),
@@ -1091,11 +1116,14 @@ class ResourceBaseViewSet(DynamicModelViewSet):
         if config.read_only or config.maintenance or request.user.is_anonymous or not request.user.is_authenticated or \
                 resource is None or not request.user.has_perm('view_resourcebase', resource.get_self_resource()):
             return Response(status=status.HTTP_403_FORBIDDEN)
+        if not resource.is_copyable:
+            return Response({"message": "Resource can not be cloned."}, status=400)
         try:
             request_params = QueryDict(request.body, mutable=True)
             _exec_request = ExecutionRequest.objects.create(
                 user=request.user,
                 func_name='copy',
+                geonode_resource=resource,
                 input_params={
                     "instance": resource.id,
                     "owner": request_params.get('owner', request.user.username),
@@ -1147,7 +1175,7 @@ class ResourceBaseViewSet(DynamicModelViewSet):
                 )
             if rating_input not in range(NUM_OF_RATINGS + 1):
                 return HttpResponseForbidden(
-                    "Invalid rating. It must be a value between 0 and {}".format(NUM_OF_RATINGS)
+                    f"Invalid rating. It must be a value between 0 and {NUM_OF_RATINGS}"
                 )
             Rating.update(
                 rating_object=resource,
@@ -1239,3 +1267,84 @@ class ResourceBaseViewSet(DynamicModelViewSet):
             'Unable to set thumbnail',
             status=status.HTTP_400_BAD_REQUEST
         )
+
+    @extend_schema(
+        methods=["get", "put", "delete", "post"], description="Get/Update/Delete/Add extra metadata for resource"
+    )
+    @action(
+        detail=True,
+        methods=["get", "put", "delete", "post"],
+        permission_classes=[
+            IsOwnerOrAdmin,
+        ],
+        url_path=r"extra_metadata",  # noqa
+        url_name="extra-metadata",
+    )
+    def extra_metadata(self, request, pk=None):
+        _obj = self.get_object()
+        if request.method == "GET":
+            # get list of available metadata
+            queryset = _obj.metadata.all()
+            _filters = [{f"metadata__{key}": value} for key, value in request.query_params.items()]
+            if _filters:
+                queryset = queryset.filter(**_filters[0])
+            return Response(ExtraMetadataSerializer().to_representation(queryset))
+        if not request.method == "DELETE":
+            try:
+                extra_metadata = validate_extra_metadata(request.data, _obj)
+            except Exception as e:
+                return Response(status=500, data=e.args[0])
+
+        if request.method == "PUT":
+            '''
+            update specific metadata. The ID of the metadata is required to perform the update
+            [
+                {
+                        "id": 1,
+                        "name": "foo_name",
+                        "slug": "foo_sug",
+                        "help_text": "object",
+                        "field_type": "int",
+                        "value": "object",
+                        "category": "object"
+                }
+            ]
+            '''
+            for _m in extra_metadata:
+                _id = _m.pop('id')
+                ResourceBase.objects.filter(id=_obj.id).first().metadata.filter(id=_id).update(metadata=_m)
+            logger.info("metadata updated for the selected resource")
+            _obj.refresh_from_db()
+            return Response(ExtraMetadataSerializer().to_representation(_obj.metadata.all()))
+        elif request.method == "DELETE":
+            # delete single metadata
+            '''
+            Expect a payload with the IDs of the metadata that should be deleted. Payload be like:
+            [4, 3]
+            '''
+            ResourceBase.objects.filter(id=_obj.id).first().metadata.filter(id__in=request.data).delete()
+            _obj.refresh_from_db()
+            return Response(ExtraMetadataSerializer().to_representation(_obj.metadata.all()))
+        elif request.method == "POST":
+            # add new metadata
+            '''
+            [
+                {
+                        "name": "foo_name",
+                        "slug": "foo_sug",
+                        "help_text": "object",
+                        "field_type": "int",
+                        "value": "object",
+                        "category": "object"
+                }
+            ]
+            '''
+            for _m in extra_metadata:
+                new_m = ExtraMetadata.objects.create(
+                    resource=_obj,
+                    metadata=_m
+                )
+                new_m.save()
+                _obj.metadata.add(new_m)
+            _obj.refresh_from_db()
+            return Response(ExtraMetadataSerializer().to_representation(_obj.metadata.all()), status=201)

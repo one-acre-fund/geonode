@@ -16,6 +16,8 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 #
 #########################################################################
+
+import os
 import copy
 import json
 import typing
@@ -43,7 +45,7 @@ from django.contrib.contenttypes.models import ContentType
 
 from geonode.thumbs.thumbnails import _generate_thumbnail_name
 from geonode.documents.tasks import create_document_thumbnail
-from geonode.thumbs.utils import MISSING_THUMB
+from geonode.thumbs import utils as thumb_utils
 from geonode.security.permissions import (
     PermSpecCompact,
     VIEW_PERMISSIONS,
@@ -257,10 +259,10 @@ class ResourceManager(ResourceManagerInterface):
                 try:
                     if isinstance(_resource.get_real_instance(), Dataset):
                         """
-                        - Remove any associated style to the layer, if it is not used by other layers.
+                        - Remove any associated style to the dataset, if it is not used by other datasets.
                         - Default style will be deleted in post_delete_dataset.
-                        - Remove the layer from any associated map, if any.
-                        - Remove the layer default style.
+                        - Remove the dataset from any associated map, if any.
+                        - Remove the dataset default style.
                         """
                         try:
                             from geonode.maps.models import MapLayer
@@ -281,16 +283,8 @@ class ResourceManager(ResourceManagerInterface):
                         except Exception as e:
                             logger.exception(e)
 
-                        try:
-                            if 'geonode.upload' in settings.INSTALLED_APPS and \
-                                    settings.UPLOADER['BACKEND'] == 'geonode.importer':
-                                from geonode.upload.models import Upload
-                                # Need to call delete one by one in ordee to invoke the
-                                #  'delete' overridden method
-                                for upload in Upload.objects.filter(resource_id=_resource.get_real_instance().id):
-                                    upload.delete()
-                        except Exception as e:
-                            logger.exception(e)
+                        # Remove uploaded files, if any
+                        ResourceBase.objects.cleanup_uploaded_files(resource_id=_resource.id)
 
                         try:
                             _resource.get_real_instance().styles.delete()
@@ -334,15 +328,16 @@ class ResourceManager(ResourceManagerInterface):
                     _resource.set_missing_info()
                     _resource = self._concrete_resource_manager.create(uuid, resource_type=resource_type, defaults=defaults)
                 _resource.set_processing_state(enumerations.STATE_PROCESSED)
+                _resource.save()
+                resourcebase_post_save(_resource.get_real_instance())
             except Exception as e:
                 logger.exception(e)
                 self.delete(_resource.uuid, instance=_resource)
                 raise e
-            resourcebase_post_save(_resource.get_real_instance())
         return _resource
 
     def update(self, uuid: str, /, instance: ResourceBase = None, xml_file: str = None, metadata_uploaded: bool = False,
-               vals: dict = {}, regions: list = [], keywords: list = [], custom: dict = {}, notify: bool = True) -> ResourceBase:
+               vals: dict = {}, regions: list = [], keywords: list = [], custom: dict = {}, notify: bool = True, extra_metadata: list = []) -> ResourceBase:
         _resource = instance or ResourceManager._get_instance(uuid)
         if _resource:
             _resource.set_processing_state(enumerations.STATE_RUNNING)
@@ -354,22 +349,29 @@ class ResourceManager(ResourceManagerInterface):
                     if metadata_uploaded and xml_file:
                         _md_file = None
                         try:
-                            _md_file = storage_manager.open(xml_file)
+                            _md_file = storage_manager.open(xml_file, mode='r')
                         except Exception as e:
                             logger.exception(e)
-                            _md_file = open(xml_file)
-
-                        _resource.metadata_xml = _md_file.read()
-
-                        _uuid, vals, regions, keywords, custom = parse_metadata(_md_file.read())
-                        if uuid and uuid != _uuid:
-                            raise ValidationError("The UUID identifier from the XML Metadata is different from the {_resource} one.")
-                        else:
-                            uuid = _uuid
+                            if os.path.exists(xml_file) and os.path.isfile(xml_file):
+                                _md_file = open(xml_file, mode='r')
+                        if _md_file:
+                            _md_file_content = _md_file.read()
+                            _resource.metadata_xml = _md_file_content
+                            _uuid, vals, regions, keywords, custom = parse_metadata(_md_file_content)
+                            if uuid and uuid != _uuid:
+                                raise ValidationError("The UUID identifier from the XML Metadata is different from the {_resource} one.")
+                            else:
+                                uuid = _uuid
 
                     logger.debug(f'Update Dataset with information coming from XML File if available {_resource}')
                     _resource.save()
-                    _resource = update_resource(instance=_resource.get_real_instance(), regions=regions, keywords=keywords, vals=vals)
+                    _resource = update_resource(
+                        instance=_resource.get_real_instance(),
+                        regions=regions,
+                        keywords=keywords,
+                        vals=vals,
+                        extra_metadata=extra_metadata
+                    )
                     _resource = self._concrete_resource_manager.update(uuid, instance=_resource, notify=notify)
                     _resource = metadata_storers(_resource.get_real_instance(), custom)
 
@@ -380,11 +382,11 @@ class ResourceManager(ResourceManagerInterface):
                         for _task in _p.get_tasks():
                             _task.execute(_resource)
                 _resource.set_processing_state(enumerations.STATE_PROCESSED)
-                _resource.save(notify=notify)
             except Exception as e:
                 logger.exception(e)
                 _resource.set_processing_state(enumerations.STATE_INVALID)
                 _resource.set_dirty_state()
+            _resource.save(notify=notify)
             resourcebase_post_save(_resource.get_real_instance())
         return _resource
 
@@ -483,6 +485,8 @@ class ResourceManager(ResourceManagerInterface):
                     anonymous_group = 'anonymous' if 'anonymous' in _perms['groups'] else Group.objects.get(name='anonymous')
                     _perms['groups'].pop(anonymous_group)
                 self.set_permissions(_resource.uuid, instance=_resource, owner=_owner, permissions=_perms)
+                # Refresh from DB
+                _resource.refresh_from_db()
                 return self.update(_resource.uuid, _resource, vals=to_update)
         return instance
 
@@ -929,7 +933,7 @@ class ResourceManager(ResourceManagerInterface):
                         _resource.save_thumbnail(file_name, thumbnail)
                     else:
                         if instance and instance.files and isinstance(instance.get_real_instance(), Document):
-                            if overwrite or instance.thumbnail_url == static(MISSING_THUMB):
+                            if overwrite or instance.thumbnail_url == static(thumb_utils.MISSING_THUMB):
                                 create_document_thumbnail.apply((instance.id,))
                         self._concrete_resource_manager.set_thumbnail(uuid, instance=_resource, overwrite=overwrite, check_bbox=check_bbox)
                 _resource.set_processing_state(enumerations.STATE_PROCESSED)

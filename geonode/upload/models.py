@@ -35,7 +35,6 @@ from django.utils.translation import ugettext_lazy as _
 from geonode import GeoNodeException
 from geonode.base import enumerations
 from geonode.base.models import ResourceBase
-from geonode.storage.manager import storage_manager
 from geonode.geoserver.helpers import gs_uploader, ogc_server_settings
 
 logger = logging.getLogger(__name__)
@@ -112,6 +111,7 @@ class Upload(models.Model):
     date = models.DateTimeField('date', default=now)
     resource = models.ForeignKey(ResourceBase, null=True, on_delete=models.SET_NULL)
     upload_dir = models.TextField(null=True)
+    store_spatial_files = models.BooleanField(default=True)
     name = models.CharField(max_length=64, null=True)
     complete = models.BooleanField(default=False)
     # hold our serialized session object
@@ -163,10 +163,12 @@ class Upload(models.Model):
                 sld_files = uploaded_files.sld_files
                 xml_files = uploaded_files.xml_files
 
-                if self.resource and not self.resource.files:
+                if self.store_spatial_files and self.resource and not self.resource.files:
                     files_to_upload = aux_files + sld_files + xml_files + [uploaded_files.base_file]
                     if len(files_to_upload):
-                        ResourceBase.objects.upload_files(resource_id=self.resource.id, files=files_to_upload)
+                        ResourceBase.objects.upload_files(
+                            resource_id=self.resource.id,
+                            files=files_to_upload)
                         self.resource.refresh_from_db()
 
                 # Now we delete the files from local file system
@@ -254,18 +256,6 @@ class Upload(models.Model):
                 session.delete()
             except Exception:
                 logging.warning('error deleting upload session')
-
-        # we delete directly the folder with the files of the resource
-        if self.resource:
-            for _file in self.resource.files:
-                try:
-                    if storage_manager.exists(_file):
-                        storage_manager.delete(_file)
-                except Exception as e:
-                    logger.warning(e)
-
-            # Do we want to delete the files also from the resource?
-            ResourceBase.objects.filter(id=self.resource.id).update(files={})
 
         for _location in importer_locations:
             try:

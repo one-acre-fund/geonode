@@ -143,7 +143,7 @@ class DocumentsTest(GeoNodeBaseTestSupport):
             owner=superuser,
             title='theimg')
 
-        m = Map.objects.all()[0]
+        m = Map.objects.first()
         ctype = ContentType.objects.get_for_model(m)
         _d = DocumentResourceLink.objects.create(
             document_id=c.id,
@@ -195,9 +195,6 @@ class DocumentsTest(GeoNodeBaseTestSupport):
 
         # title is required
         self.assertTrue('title' in form.errors)
-
-        # permissions are required
-        self.assertTrue('permissions' in form.errors)
 
         # since neither a doc_file nor a doc_url are included __all__ should be
         # in form.errors.
@@ -313,7 +310,7 @@ class DocumentsTest(GeoNodeBaseTestSupport):
             'test_img_file.gif',
             self.imgfile.read(),
             'image/gif')
-        m = Map.objects.all()[0]
+        m = Map.objects.first()
 
         self.client.login(username='admin', password='admin')
         response = self.client.post(
@@ -740,9 +737,17 @@ class DocumentViewTestCase(GeoNodeBaseTestSupport):
         self.client.login(username=self.not_admin.username, password='very-secret')
         url = reverse('document_metadata', args=(self.test_doc.pk,))
         with self.settings(FREETEXT_KEYWORDS_READONLY=True):
-            response = self.client.post(url)
+            response = self.client.post(url, data={
+                "resource-owner": self.not_admin.id,
+                "resource-title": "doc",
+                "resource-date": "2022-01-24 16:38 pm",
+                "resource-date_type": "creation",
+                "resource-language": "eng",
+            })
             self.assertFalse(self.not_admin.is_superuser)
             self.assertEqual(response.status_code, 200)
+        self.test_doc.refresh_from_db()
+        self.assertEqual('doc', self.test_doc.title)
 
     def test_that_non_admin_user_cannot_create_edit_keyword(self):
         """
@@ -776,9 +781,18 @@ class DocumentViewTestCase(GeoNodeBaseTestSupport):
         self.client.login(username=self.not_admin.username, password='very-secret')
         url = reverse('document_metadata', args=(self.test_doc.pk,))
         with self.settings(FREETEXT_KEYWORDS_READONLY=False):
-            response = self.client.post(url, data={'resource-keywords': 'wonderful-keyword'})
+            response = self.client.post(url, data={
+                "resource-owner": self.not_admin.id,
+                "resource-title": "doc",
+                "resource-date": "2022-01-24 16:38 pm",
+                "resource-date_type": "creation",
+                "resource-language": "eng",
+                'resource-keywords': 'wonderful-keyword'
+            })
             self.assertFalse(self.not_admin.is_superuser)
             self.assertEqual(response.status_code, 200)
+        self.test_doc.refresh_from_db()
+        self.assertEqual("doc", self.test_doc.title)
 
     def test_document_link_with_permissions(self):
         self.test_doc.set_permissions(self.perm_spec)
