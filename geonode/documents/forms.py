@@ -17,7 +17,6 @@
 #
 #########################################################################
 
-from geonode.base.forms import ResourceBaseForm
 import os
 import re
 import json
@@ -34,11 +33,13 @@ from django.template.defaultfilters import filesizeformat
 
 from geonode.maps.models import Map
 from geonode.layers.models import Dataset
+from geonode.base.forms import ResourceBaseForm, get_tree_data
 from geonode.resource.utils import get_related_resources
 from geonode.documents.models import (
     Document,
     DocumentResourceLink)
 from geonode.upload.models import UploadSizeLimit
+from geonode.upload.api.exceptions import FileUploadLimitException
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +64,7 @@ class SizeRestrictedFileField(forms.FileField):
             max_size = self._get_max_size()
             # Validate
             if file_size is not None and file_size > max_size:
-                raise forms.ValidationError(_(
+                raise FileUploadLimitException(_(
                     f'File size size exceeds {filesizeformat(max_size)}. Please try again with a smaller file.'
                 ))
         return data
@@ -135,6 +136,7 @@ class DocumentForm(ResourceBaseForm, DocumentFormMixin):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.fields['regions'].choices = get_tree_data()
         self.fields['links'].choices = self.generate_link_choices()
         self.fields['links'].initial = self.generate_link_values(
             resources=get_related_resources(self.instance)

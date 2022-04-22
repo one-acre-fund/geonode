@@ -22,7 +22,6 @@ import os
 import json
 import base64
 import shutil
-import tempfile
 
 from os.path import basename, splitext
 from urllib.parse import urljoin, urlencode, urlsplit
@@ -44,7 +43,7 @@ from geonode import geoserver
 from geonode.base.models import Configuration
 from geonode.decorators import on_ogc_backend
 
-from geonode.utils import OGC_Servers_Handler
+from geonode.utils import mkdtemp, OGC_Servers_Handler
 from geonode.layers.models import Dataset, Style
 from geonode.layers.populate_datasets_data import create_dataset_data
 from geonode.base.populate_test_data import (
@@ -638,7 +637,7 @@ class LayerTests(GeoNodeBaseTestSupport):
         # getting picked up
         d = None
         try:
-            d = tempfile.mkdtemp()
+            d = mkdtemp()
             files = (
                 "san_andres_y_providencia.sld",
                 "lac.sld",
@@ -740,7 +739,7 @@ class LayerTests(GeoNodeBaseTestSupport):
             **valid_auth_headers
         )
         post_request.user = AnonymousUser()
-        raw_url, headers, access_token = check_geoserver_access(
+        raw_url, headers, access_token, downstream_path = check_geoserver_access(
             post_request,
             '/gs/rest/workspaces',
             'rest/workspaces',
@@ -751,7 +750,58 @@ class LayerTests(GeoNodeBaseTestSupport):
         self.assertIsNotNone(headers)
         self.assertIsNotNone(access_token)
 
-        authorized = style_change_check(post_request, 'rest/workspaces', access_token=access_token)
+        authorized = style_change_check(post_request, downstream_path, style_name='styles', access_token=access_token)
+        self.assertTrue(authorized)
+
+        authorized = style_change_check(post_request, 'rest/styles', style_name=f'{layer.name}', access_token=access_token)
+        self.assertTrue(authorized)
+
+        authorized = style_change_check(post_request, f'rest/workspaces/{layer.workspace}/styles/{layer.name}', style_name=f'{layer.name}', access_token=access_token)
+        self.assertTrue(authorized)
+
+        authorized = style_change_check(post_request, f'rest/layers/{layer.name}', access_token=access_token)
+        self.assertTrue(authorized)
+
+        authorized = style_change_check(post_request, f'rest/workspaces/{layer.workspace}/layers/{layer.name}', access_token=access_token)
+        self.assertTrue(authorized)
+
+        put_request = rf.put(
+            change_style_url,
+            data=san_andres_y_providencia_sld,
+            content_type='application/vnd.ogc.sld+xml',
+            **valid_auth_headers
+        )
+        put_request.user = AnonymousUser()
+        raw_url, headers, access_token, downstream_path = check_geoserver_access(
+            put_request,
+            '/gs/rest/workspaces',
+            'rest/workspaces',
+            workspace='geonode',
+            layername=layer.name,
+            allowed_hosts=[urlsplit(ogc_server_settings.public_url).hostname, ])
+        self.assertIsNotNone(raw_url)
+        self.assertIsNotNone(headers)
+        self.assertIsNotNone(access_token)
+
+        # Check that, if we have been authorized through the "access_token",
+        # we can still update a style no more present on GeoNode
+        # ref: 05b000cdb06b0b6e9b72bd9eb8a8e03abeb204a8
+        #  [Regression] "style_change_check" always fails in the case the style does not exist on GeoNode too, preventing a user editing temporary generated styles
+        Style.objects.filter(name=layer.name).delete()
+
+        authorized = style_change_check(put_request, downstream_path, style_name='styles', access_token=access_token)
+        self.assertTrue(authorized)
+
+        authorized = style_change_check(put_request, 'rest/styles', style_name=f'{layer.name}', access_token=access_token)
+        self.assertTrue(authorized)
+
+        authorized = style_change_check(put_request, f'rest/workspaces/{layer.workspace}/styles/{layer.name}', style_name=f'{layer.name}', access_token=access_token)
+        self.assertTrue(authorized)
+
+        authorized = style_change_check(put_request, f'rest/layers/{layer.name}', access_token=access_token)
+        self.assertTrue(authorized)
+
+        authorized = style_change_check(put_request, f'rest/workspaces/{layer.workspace}/layers/{layer.name}', access_token=access_token)
         self.assertTrue(authorized)
 
         # Check is NOT 'authorized'
@@ -762,7 +812,7 @@ class LayerTests(GeoNodeBaseTestSupport):
             **invalid_auth_headers
         )
         post_request.user = AnonymousUser()
-        raw_url, headers, access_token = check_geoserver_access(
+        raw_url, headers, access_token, downstream_path = check_geoserver_access(
             post_request,
             '/gs/rest/workspaces',
             'rest/workspaces',
@@ -773,7 +823,7 @@ class LayerTests(GeoNodeBaseTestSupport):
         self.assertIsNotNone(headers)
         self.assertIsNone(access_token)
 
-        authorized = style_change_check(post_request, 'rest/workspaces', access_token=access_token)
+        authorized = style_change_check(post_request, downstream_path, access_token=access_token)
         self.assertFalse(authorized)
 
     @on_ogc_backend(geoserver.BACKEND_PACKAGE)
@@ -1141,7 +1191,7 @@ class LayerTests(GeoNodeBaseTestSupport):
 
             # Delete all 'original' and 'metadata' links
             _links.delete()
-            self.assertFalse(_links.count() > 0, "No links have been deleted")
+            self.assertFalse(_links.exists(), "No links have been deleted")
             # Delete resources metadata
             _datasets = Dataset.objects.exclude(
                 Q(metadata_xml__isnull=True) |
@@ -1169,7 +1219,7 @@ class LayerTests(GeoNodeBaseTestSupport):
             # Check links
             _post_migrate_links = Link.objects.filter(link_type__in=_def_link_types)
             self.assertTrue(
-                _post_migrate_links.count() > 0,
+                _post_migrate_links.exists(),
                 "No links have been restored"
             )
             # Check layers
@@ -1188,7 +1238,7 @@ class LayerTests(GeoNodeBaseTestSupport):
                     link_type='original'
                 )
                 self.assertTrue(
-                    _post_migrate_links_orig.count() > 0,
+                    _post_migrate_links_orig.exists(),
                     f"No 'original' links has been found for the layer '{_lyr.alternate}'"
                 )
                 for _link_orig in _post_migrate_links_orig:
@@ -1223,3 +1273,9 @@ attribute of the layer '{_lyr.alternate}'"
                         _post_migrate_link_meta,
                         f"No '{name}' links have been found in the catalogue for the resource '{_lyr.alternate}'"
                     )
+
+    @on_ogc_backend(geoserver.BACKEND_PACKAGE)
+    def test_gs_proxy_never_caches(self):
+        url = reverse('gs_styles')
+        response = self.client.get(url)
+        self.assertFalse(response.has_header('Cache-Control'))

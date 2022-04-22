@@ -92,6 +92,19 @@ LAYER_SUBTYPES = {
     "vectorTimeSeries": "vector_time"
 }
 
+WPS_ACCEPTABLE_FORMATS = [
+    ('application/json', 'vector'),
+    ('application/arcgrid', 'raster'),
+    ('image/tiff', 'raster'),
+    ('image/png', 'raster'),
+    ('image/jpeg', 'raster'),
+    ('application/wfs-collection-1.0', 'vector'),
+    ('application/wfs-collection-1.1', 'vector'),
+    ('application/zip', 'vector'),
+    ('text/csv', 'vector')
+]
+
+
 if not hasattr(settings, 'OGC_SERVER'):
     msg = (
         'Please configure OGC_SERVER when enabling geonode.geoserver.'
@@ -473,6 +486,11 @@ def cascading_delete(dataset_name=None, catalog=None):
             return None
         else:
             raise e
+    finally:
+        # Let's reset the connections first
+        cat._cache.clear()
+        cat.reset()
+        cat.reload()
 
     if resource is None:
         # If there is no associated resource,
@@ -517,14 +535,16 @@ def cascading_delete(dataset_name=None, catalog=None):
         try:
             cat.delete(resource, recurse=True)  # This may fail
         except Exception:
-            cat._cache.clear()
-            cat.reset()
+            pass
 
         if store.resource_type == 'dataStore' and 'dbtype' in store.connection_parameters and \
                 store.connection_parameters['dbtype'] == 'postgis':
             delete_from_postgis(resource_name, store)
         else:
-            if store.resource_type == 'coverageStore':
+            # AF: for the time being this one mitigates the issue #8671
+            # until we find a suitable solution for the GeoTools ImageMosaic plugin
+            # ref: https://github.com/geotools/geotools/blob/main/modules/plugin/imagemosaic/src/main/java/org/geotools/gce/imagemosaic/catalog/AbstractGTDataStoreGranuleCatalog.java#L753
+            if store.resource_type == 'coverageStore' and store.type != 'ImageMosaic':
                 try:
                     logger.debug(f" - Going to purge the {store.resource_type} : {store.href}")
                     cat.reset()  # this resets the coverage readers and unlocks the files
@@ -578,7 +598,7 @@ def delete_from_postgis(dataset_name, store):
 
 
 def gs_slurp(
-        ignore_errors=True,
+        ignore_errors=False,
         verbosity=1,
         console=None,
         owner=None,
@@ -594,6 +614,8 @@ def gs_slurp(
        It returns a list of dictionaries with the name of the layer,
        the result of the operation and the errors and traceback if it failed.
     """
+    from geonode.resource.manager import resource_manager
+
     if console is None:
         console = open(os.devnull, 'w')
 
@@ -667,7 +689,7 @@ def gs_slurp(
                 raise
 
     # filter out layers already registered in geonode
-    dataset_names = Dataset.objects.all().values_list('alternate', flat=True)
+    dataset_names = Dataset.objects.values_list('alternate', flat=True)
     if skip_geonode_registered:
         try:
             resources = [k for k in resources
@@ -701,49 +723,65 @@ def gs_slurp(
         name = resource.name
         the_store = resource.store
         workspace = the_store.workspace
+        layer = None
         try:
             created = False
             layer = Dataset.objects.filter(name=name, workspace=workspace.name).first()
             if not layer:
-                layer = Dataset.objects.create(
-                    name=name,
-                    workspace=workspace.name,
-                    store=the_store.name,
-                    subtype=get_dataset_storetype(the_store.resource_type),
-                    alternate=f"{workspace.name}:{resource.name}",
-                    title=resource.title or _('No title provided'),
-                    abstract=resource.abstract or _('No abstract provided'),
-                    owner=owner,
-                    uuid=str(uuid.uuid4())
+                layer = resource_manager.create(
+                    str(uuid.uuid4()),
+                    resource_type=Dataset,
+                    defaults=dict(
+                        name=name,
+                        workspace=workspace.name,
+                        store=the_store.name,
+                        subtype=get_dataset_storetype(the_store.resource_type),
+                        alternate=f"{workspace.name}:{resource.name}",
+                        title=resource.title or _('No title provided'),
+                        abstract=resource.abstract or _('No abstract provided'),
+                        owner=owner
+                    )
                 )
                 created = True
+            # Hide the resource until finished
+            layer.set_processing_state("RUNNING")
             bbox = resource.native_bbox
-            layer.set_bbox_polygon([bbox[0], bbox[2], bbox[1], bbox[3]], resource.projection)
+            ll_bbox = resource.latlon_bbox
+            try:
+                layer.set_bbox_polygon([bbox[0], bbox[2], bbox[1], bbox[3]], resource.projection)
+            except GeoNodeException as e:
+                if not ll_bbox:
+                    raise
+                else:
+                    logger.exception(e)
+                    layer.srid = 'EPSG:4326'
+            layer.set_ll_bbox_polygon([ll_bbox[0], ll_bbox[2], ll_bbox[1], ll_bbox[3]])
 
             # sync permissions in GeoFence
             perm_spec = json.loads(_perms_info_json(layer))
-            layer.set_permissions(perm_spec)
+            resource_manager.set_permissions(
+                layer.uuid,
+                permissions=perm_spec)
 
             # recalculate the layer statistics
             set_attributes_from_geoserver(layer, overwrite=True)
 
             # in some cases we need to explicitily save the resource to execute the signals
             # (for sure when running updatelayers)
-            if execute_signals:
-                layer.save(notify=True)
+            resource_manager.update(
+                layer.uuid,
+                instance=layer,
+                notify=execute_signals)
 
-            # Fix metadata links if the ip has changed
-            if layer.link_set.metadata().count() > 0:
-                if not created and settings.SITEURL not in layer.link_set.metadata()[0].url:
-                    layer.link_set.metadata().delete()
-                    layer.save()
-                    metadata_links = []
-                    for link in layer.link_set.metadata():
-                        metadata_links.append((link.mime, link.name, link.url))
-                    resource.metadata_links = metadata_links
-                    cat.save(resource)
+            # Creating the Thumbnail
+            resource_manager.set_thumbnail(
+                layer.uuid,
+                overwrite=True, check_bbox=False
+            )
 
         except Exception as e:
+            # Hide the resource until finished
+            layer.set_processing_state("FAILED")
             if ignore_errors:
                 status = 'failed'
                 exception_type, error, traceback = sys.exc_info()
@@ -752,7 +790,6 @@ def gs_slurp(
                     msg = "Stopping process because --ignore-errors was not set and an error was found."
                     print(msg, file=sys.stderr)
                 raise Exception(f"Failed to process {resource.name}") from e
-
         else:
             if created:
                 if not permissions:
@@ -940,7 +977,7 @@ def set_attributes(
                 if _gs_attrs.count() == 1:
                     la = _gs_attrs.get()
                 else:
-                    if _gs_attrs.count() > 0:
+                    if _gs_attrs.exists():
                         _gs_attrs.delete()
                     la = Attribute.objects.create(dataset=layer, attribute=field)
                     la.visible = ftype.find("gml:") != 0
@@ -979,7 +1016,15 @@ def set_attributes_from_geoserver(layer, overwrite=False):
     then store in GeoNode database using Attribute model
     """
     attribute_map = []
-    server_url = ogc_server_settings.LOCATION if layer.subtype not in ['tileStore', 'remote'] else layer.remote_service.service_url
+    if getattr(layer, 'remote_service') and layer.remote_service:
+        server_url = layer.remote_service.service_url
+        if layer.remote_service.operations.get('GetCapabilities', None) and layer.remote_service.operations.get('GetCapabilities').get('methods'):
+            for _method in layer.remote_service.operations.get('GetCapabilities').get('methods'):
+                if _method.get('type', '').upper() == 'GET':
+                    server_url = _method.get('url', server_url)
+                    break
+    else:
+        server_url = ogc_server_settings.LOCATION
     if layer.subtype in ['tileStore', 'remote'] and layer.remote_service.ptype == "gxp_arcrestsource":
         dft_url = f"{server_url}{(layer.alternate or layer.typename)}?f=json"
         try:
@@ -994,13 +1039,16 @@ def set_attributes_from_geoserver(layer, overwrite=False):
             attribute_map = []
     elif layer.subtype in {"vector", "tileStore", "remote", "wmsStore"}:
         typename = layer.alternate if layer.alternate else layer.typename
-        dft_url = re.sub(r"\/wms\/?$",
-                         "/",
-                         server_url) + "ows?" + urlencode({"service": "wfs",
-                                                           "version": "1.0.0",
-                                                           "request": "DescribeFeatureType",
-                                                           "typename": typename,
-                                                           })
+        dft_url_path = re.sub(r"\/wms\/?$", "/", server_url)
+        dft_query = urlencode(
+            {
+                "service": "wfs",
+                "version": "1.0.0",
+                "request": "DescribeFeatureType",
+                "typename": typename
+            }
+        )
+        dft_url = urljoin(dft_url_path, f"ows?{dft_query}")
         try:
             # The code below will fail if http_client cannot be imported or WFS not supported
             req, body = http_client.get(dft_url, user=_user)
@@ -1042,14 +1090,9 @@ def set_attributes_from_geoserver(layer, overwrite=False):
                 tb = traceback.format_exc()
                 logger.debug(tb)
                 attribute_map = []
-    elif layer.subtype in ["coverageStore"]:
+    elif layer.subtype in ["raster"]:
         typename = layer.alternate if layer.alternate else layer.typename
-        dc_url = server_url + "wcs?" + urlencode({
-            "service": "wcs",
-            "version": "1.1.0",
-            "request": "DescribeCoverage",
-            "identifiers": typename
-        })
+        dc_url = f"{server_url}wcs?{urlencode({'service': 'wcs', 'version': '1.1.0', 'request': 'DescribeCoverage', 'identifiers': typename})}"
         try:
             req, body = http_client.get(dc_url, user=_user)
             doc = dlxml.fromstring(body.encode())
@@ -1955,141 +1998,147 @@ def sync_instance_with_geoserver(
         else:
             return instance
 
-    if updatemetadata:
-        # Save layer attributes
-        logger.debug(f"... Refresh GeoServer attributes list for Dataset {instance.title}")
-        try:
-            set_attributes_from_geoserver(instance)
-        except Exception as e:
-            logger.exception(e)
-
-    # Don't run this signal handler if it is a tile layer or a remote store (Service)
-    #    Currently only gpkg files containing tiles will have this type & will be served via MapProxy.
-    if hasattr(instance, 'subtype') and getattr(instance, 'subtype') in ['tileStore', 'remote']:
-        return instance
-
-    gs_resource = None
-    values = None
-    _tries = 0
-    _max_tries = getattr(ogc_server_settings, "MAX_RETRIES", 2)
-
     try:
-        # If the store in None then it's a new instance from an upload,
-        # only in this case run the geoserver_upload method
-        if getattr(instance, 'overwrite', False):
-            base_file, info = instance.get_base_file()
+        instance.set_processing_state("RUNNING")
+        if updatemetadata:
+            # Save layer attributes
+            logger.debug(f"... Refresh GeoServer attributes list for Dataset {instance.title}")
+            try:
+                set_attributes_from_geoserver(instance)
+            except Exception as e:
+                logger.warning(e)
 
-            # There is no need to process it if there is no file.
-            if base_file is None:
-                return
-            from geonode.geoserver.upload import geoserver_upload
-            gs_name, workspace, values, gs_resource = geoserver_upload(
-                instance,
-                base_file.file.path,
-                instance.owner,
-                instance.name,
-                overwrite=True,
-                title=instance.title,
-                abstract=instance.abstract,
-                charset=instance.charset
-            )
+        # Don't run this signal handler if it is a tile layer or a remote store (Service)
+        #    Currently only gpkg files containing tiles will have this type & will be served via MapProxy.
+        _is_remote_instance = hasattr(instance, 'subtype') and getattr(instance, 'subtype') in ['tileStore', 'remote']
 
-        values, gs_resource = fetch_gs_resource(instance, values, _tries)
-        while not gs_resource and _tries < _max_tries:
+        # Let's reset the connections first
+        gs_catalog._cache.clear()
+        gs_catalog.reset()
+
+        gs_resource = None
+        if not _is_remote_instance:
+            values = None
+            _tries = 0
+            _max_tries = getattr(ogc_server_settings, "MAX_RETRIES", 3)
+
+            # If the store in None then it's a new instance from an upload,
+            # only in this case run the geoserver_upload method
+            if getattr(instance, 'overwrite', False):
+                base_file, info = instance.get_base_file()
+
+                # There is no need to process it if there is no file.
+                if base_file:
+                    from geonode.geoserver.upload import geoserver_upload
+                    gs_name, workspace, values, gs_resource = geoserver_upload(
+                        instance,
+                        base_file.file.path,
+                        instance.owner,
+                        instance.name,
+                        overwrite=True,
+                        title=instance.title,
+                        abstract=instance.abstract,
+                        charset=instance.charset
+                    )
+
             values, gs_resource = fetch_gs_resource(instance, values, _tries)
-            _tries += 1
+            while not gs_resource and _tries < _max_tries:
+                values, gs_resource = fetch_gs_resource(instance, values, _tries)
+                _tries += 1
+                time.sleep(3)
 
-        # Get metadata links
-        metadata_links = []
-        for link in instance.link_set.metadata():
-            metadata_links.append((link.mime, link.name, link.url))
+            # Get metadata links
+            metadata_links = []
+            for link in instance.link_set.metadata():
+                metadata_links.append((link.mime, link.name, link.url))
 
-        if gs_resource:
-            logger.debug(f"Found geoserver resource for this dataset: {instance.name}")
-            instance.gs_resource = gs_resource
+            if gs_resource:
+                logger.debug(f"Found geoserver resource for this dataset: {instance.name}")
+                instance.gs_resource = gs_resource
 
-            # Iterate over values from geoserver.
-            for key in ['alternate', 'store', 'subtype']:
-                # attr_name = key if 'typename' not in key else 'alternate'
-                # print attr_name
-                setattr(instance, key, get_dataset_storetype(values[key]))
+                # Iterate over values from geoserver.
+                for key in ['alternate', 'store', 'subtype']:
+                    # attr_name = key if 'typename' not in key else 'alternate'
+                    # print attr_name
+                    setattr(instance, key, get_dataset_storetype(values[key]))
 
-            if updatemetadata:
-                gs_resource.metadata_links = metadata_links
+                if updatemetadata:
+                    gs_resource.metadata_links = metadata_links
 
-                # Update Attribution link
-                if instance.poc:
-                    # gsconfig now utilizes an attribution dictionary
-                    gs_resource.attribution = {
-                        'title': str(instance.poc),
-                        'width': None,
-                        'height': None,
-                        'href': None,
-                        'url': None,
-                        'type': None}
-                    profile = get_user_model().objects.get(username=instance.poc.username)
-                    site_url = settings.SITEURL.rstrip('/') if settings.SITEURL.startswith('http') else settings.SITEURL
-                    gs_resource.attribution_link = site_url + profile.get_absolute_url()
+                    # Update Attribution link
+                    if instance.poc:
+                        # gsconfig now utilizes an attribution dictionary
+                        gs_resource.attribution = {
+                            'title': str(instance.poc),
+                            'width': None,
+                            'height': None,
+                            'href': None,
+                            'url': None,
+                            'type': None}
+                        profile = get_user_model().objects.get(username=instance.poc.username)
+                        site_url = settings.SITEURL.rstrip('/') if settings.SITEURL.startswith('http') else settings.SITEURL
+                        gs_resource.attribution_link = site_url + profile.get_absolute_url()
 
-                try:
-                    if settings.RESOURCE_PUBLISHING:
-                        if instance.is_published != gs_resource.advertised:
-                            gs_resource.advertised = 'true'
+                    try:
+                        if settings.RESOURCE_PUBLISHING:
+                            if instance.is_published != gs_resource.advertised:
+                                gs_resource.advertised = 'true'
 
-                    if any(instance.keyword_list()):
-                        keywords = gs_resource.keywords + instance.keyword_list()
-                        gs_resource.keywords = list(set(keywords))
+                        if any(instance.keyword_list()):
+                            keywords = gs_resource.keywords + instance.keyword_list()
+                            gs_resource.keywords = list(set(keywords))
 
-                    # gs_resource should only be called if
-                    # ogc_server_settings.BACKEND_WRITE_ENABLED == True
-                    if getattr(ogc_server_settings, "BACKEND_WRITE_ENABLED", True):
-                        gs_catalog.save(gs_resource)
-                except Exception as e:
-                    msg = (f'Error while trying to save resource named {gs_resource} in GeoServer, try to use: "{e}"')
-                    e.args = (msg,)
-                    logger.exception(e)
+                        # gs_resource should only be called if
+                        # ogc_server_settings.BACKEND_WRITE_ENABLED == True
+                        if getattr(ogc_server_settings, "BACKEND_WRITE_ENABLED", True):
+                            gs_catalog.save(gs_resource)
+                    except Exception as e:
+                        msg = (f'Error while trying to save resource named {gs_resource} in GeoServer, try to use: "{e}"')
+                        e.args = (msg,)
+                        logger.warning(e)
 
-            if updatebbox:
-                # store the resource to avoid another geoserver call in the post_save
-                """Get information from geoserver.
-                The attributes retrieved include:
-                * Bounding Box
-                * SRID
-                """
-                try:
+                if updatebbox:
+                    # store the resource to avoid another geoserver call in the post_save
+                    """Get information from geoserver.
+                    The attributes retrieved include:
+                    * Bounding Box
+                    * SRID
+                    """
                     # This is usually done in Dataset.pre_save, however if the hooks
                     # are bypassed by custom create/updates we need to ensure the
                     # bbox is calculated properly.
                     srid = gs_resource.projection
                     bbox = gs_resource.native_bbox
-                    instance.set_bbox_polygon([bbox[0], bbox[2], bbox[1], bbox[3]], srid)
-                except Exception as e:
-                    logger.exception(e)
-                    srid = instance.srid
-                    bbox = instance.bbox
+                    ll_bbox = gs_resource.latlon_bbox
+                    try:
+                        instance.set_bbox_polygon([bbox[0], bbox[2], bbox[1], bbox[3]], srid)
+                    except GeoNodeException as e:
+                        if not ll_bbox:
+                            raise
+                        else:
+                            logger.exception(e)
+                            instance.srid = 'EPSG:4326'
+                            Dataset.objects.filter(id=instance.id).update(srid=instance.srid)
+                    instance.set_ll_bbox_polygon([ll_bbox[0], ll_bbox[2], ll_bbox[1], ll_bbox[3]])
 
-                if instance.srid:
-                    instance.srid_url = f"http://www.spatialreference.org/ref/{instance.srid.replace(':', '/').lower()}/"
-                elif instance.bbox_polygon is not None:
-                    # Guessing 'EPSG:4326' by default
-                    instance.srid = 'EPSG:4326'
-                else:
-                    raise GeoNodeException(_("Invalid Projection. Dataset is missing CRS!"))
+                    if instance.srid:
+                        instance.srid_url = f"http://www.spatialreference.org/ref/{instance.srid.replace(':', '/').lower()}/"
+                    else:
+                        raise GeoNodeException(_("Invalid Projection. Dataset is missing CRS!"))
 
-            # Update the instance
-            to_update = {}
-            if updatemetadata:
-                to_update = {
-                    'title': instance.title or instance.name,
-                    'abstract': instance.abstract or "",
-                    'alternate': instance.alternate
-                }
+                # Update the instance
+                to_update = {}
+                if updatemetadata:
+                    to_update = {
+                        'title': instance.title or instance.name,
+                        'abstract': instance.abstract or "",
+                        'alternate': instance.alternate
+                    }
 
-            if updatebbox and is_monochromatic_image(instance.thumbnail_url):
-                to_update['thumbnail_url'] = static(MISSING_THUMB)
+                if updatebbox and is_monochromatic_image(instance.thumbnail_url):
+                    to_update['thumbnail_url'] = static(MISSING_THUMB)
 
-            # Save all the modified information in the instance without triggering signals.
-            try:
+                # Save all the modified information in the instance without triggering signals.
                 with transaction.atomic():
                     ResourceBase.objects.filter(
                         id=instance.resourcebase_ptr.id).update(
@@ -2100,78 +2149,39 @@ def sync_instance_with_geoserver(
                     to_update['store'] = gs_resource.store.name
                     to_update['subtype'] = instance.subtype
                     to_update['typename'] = instance.alternate
-
+                    to_update['srid'] = instance.srid
                     Dataset.objects.filter(id=instance.id).update(**to_update)
-
-                    if updatebbox:
-                        # Dealing with the BBOX: this is a trick to let GeoDjango storing original coordinates
-                        instance.set_bbox_polygon([bbox[0], bbox[2], bbox[1], bbox[3]], 'EPSG:4326')
-                        Dataset.objects.filter(id=instance.id).update(
-                            bbox_polygon=instance.bbox_polygon, srid=srid)
 
                     # Refresh from DB
                     instance.refresh_from_db()
-            except Exception as e:
-                logger.exception(e)
 
-            if updatebbox:
-                try:
-                    with transaction.atomic():
-                        match = re.match(r'^(EPSG:)?(?P<srid>\d{4,6})$', str(srid))
-                        instance.bbox_polygon.srid = int(match.group('srid')) if match else 4326
-                        Dataset.objects.filter(id=instance.id).update(
-                            ll_bbox_polygon=instance.bbox_polygon, srid=srid)
-
-                        # Refresh from DB
-                        instance.refresh_from_db()
-                except Exception as e:
-                    logger.warning(e)
+                if updatemetadata:
+                    # Save dataset styles
+                    logger.debug(f"... Refresh Legend links for Dataset {instance.title}")
                     try:
-                        with transaction.atomic():
-                            instance.bbox_polygon.srid = 4326
-                            Dataset.objects.filter(id=instance.id).update(
-                                ll_bbox_polygon=instance.bbox_polygon, srid=srid)
-
-                            # Refresh from DB
-                            instance.refresh_from_db()
+                        set_styles(instance, gs_catalog)
                     except Exception as e:
                         logger.warning(e)
 
-            if updatemetadata:
-                # Save dataset styles
-                logger.debug(f"... Refresh Legend links for Dataset {instance.title}")
-                try:
-                    set_styles(instance, gs_catalog)
-                except Exception as e:
-                    logger.exception(e)
+                    # Invalidate GeoWebCache for the updated resource
+                    try:
+                        _stylefilterparams_geowebcache_dataset(instance.alternate)
+                        _invalidate_geowebcache_dataset(instance.alternate)
+                    except Exception as e:
+                        logger.warning(e)
 
-                # Invalidate GeoWebCache for the updated resource
-                try:
-                    _stylefilterparams_geowebcache_dataset(instance.alternate)
-                    _invalidate_geowebcache_dataset(instance.alternate)
-                except Exception:
-                    pass
-        else:
-            return None
-    except Exception as e:
-        logger.exception(e)
-        return None
+        # Refreshing dataset links
+        logger.debug(f"... Creating Default Resource Links for Dataset {instance.title}")
+        set_resource_default_links(instance, instance, prune=_is_remote_instance)
 
-    # Refreshing dataset links
-    logger.debug(f"... Creating Default Resource Links for Dataset {instance.title}")
-    try:
-        _prune = (gs_resource is not None)
-        set_resource_default_links(instance, instance, prune=_prune)
-    except Exception as e:
-        logger.exception(e)
-
-    # Refreshing CSW records
-    logger.debug(f"... Updating the Catalogue entries for Dataset {instance.title}")
-    try:
+        # Refreshing CSW records
+        logger.debug(f"... Updating the Catalogue entries for Dataset {instance.title}")
         catalogue_post_save(instance=instance, sender=instance.__class__)
+        instance.set_processing_state("PROCESSED")
     except Exception as e:
         logger.exception(e)
-
+        instance.set_processing_state("FAILED")
+        raise GeoNodeException(e)
     return instance
 
 
@@ -2256,3 +2266,7 @@ def get_dataset_type(spatial_files):
     else:
         the_dataset_type = spatial_files[0].file_type.dataset_type
     return the_dataset_type
+
+
+def wps_format_is_supported(_format, dataset_type):
+    return (_format, dataset_type) in WPS_ACCEPTABLE_FORMATS

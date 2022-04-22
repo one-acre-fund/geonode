@@ -17,18 +17,16 @@
 #
 #########################################################################
 import os
-import tempfile
 import zipfile
 
 from django import forms
-from django.conf import settings
 
 from geonode import geoserver
 from geonode.utils import check_ogc_backend
 
 import json
-from geonode.utils import unzip_file
-from geonode.base.forms import ResourceBaseForm
+from geonode.utils import unzip_file, mkdtemp
+from geonode.base.forms import ResourceBaseForm, get_tree_data
 from geonode.layers.models import Dataset, Attribute
 
 
@@ -47,6 +45,7 @@ class JSONField(forms.CharField):
 
 
 class DatasetForm(ResourceBaseForm):
+
     class Meta(ResourceBaseForm.Meta):
         model = Dataset
         exclude = ResourceBaseForm.Meta.exclude + (
@@ -72,6 +71,7 @@ class DatasetForm(ResourceBaseForm):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.fields['regions'].choices = get_tree_data()
         for field in self.fields:
             help_text = self.fields[field].help_text
             self.fields[field].help_text = None
@@ -202,7 +202,7 @@ class LayerUploadForm(forms.Form):
 
     def write_files(self):
         absolute_base_file = None
-        tempdir = tempfile.mkdtemp(dir=settings.STATIC_ROOT)
+        tempdir = mkdtemp()
         if zipfile.is_zipfile(self.cleaned_data['base_file']):
             absolute_base_file = unzip_file(self.cleaned_data['base_file'],
                                             '.shp', tempdir=tempdir)

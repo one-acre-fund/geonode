@@ -21,12 +21,13 @@ import os
 import re
 import html
 import math
-import shutil
+import uuid
 import logging
 import traceback
 from sequences.models import Sequence
 
 from sequences import get_next_value
+from django.db import transaction
 
 from django.db import models
 from django.db.models import Max
@@ -59,6 +60,7 @@ from taggit.managers import TaggableManager, _TaggableManager
 
 from guardian.shortcuts import get_anonymous_user, get_objects_for_user
 from treebeard.mp_tree import MP_Node, MP_NodeQuerySet, MP_NodeManager
+from geonode import GeoNodeException
 
 from geonode.base import enumerations
 from geonode.singleton import SingletonModel
@@ -419,6 +421,7 @@ class HierarchicalKeyword(TagBase, MP_Node):
                         node = node["nodes"][-1]
                     else:
                         node = item_found
+                        node["nodes"] = getattr(node, "nodes", [])
 
         # All leaves appended but a child which is not a leaf may not be added
         # again, as a leaf, but only its tag count be updated
@@ -461,13 +464,20 @@ class _HierarchicalTagManager(_TaggableManager):
         tag_objs = set(tags) - str_tags
         # If str_tags has 0 elements Django actually optimizes that to not do a
         # query.  Malcolm is very smart.
-        existing = self.through.tag_model().objects.filter(
+        '''
+        To avoid concurrency with the keyword in case of a massive upload.
+        With the transaction block and the select_for_update,
+        we can easily handle the concurrency.
+        DOC: https://docs.djangoproject.com/en/3.2/ref/models/querysets/#select-for-update
+        '''
+        existing = self.through.tag_model().objects.select_for_update().filter(
             name__in=str_tags, **tag_kwargs
         )
-        tag_objs.update(existing)
-        new_ids = set()
-        for new_tag in str_tags - set(t.name for t in existing):
-            if new_tag:
+        with transaction.atomic():
+            tag_objs.update(existing)
+            new_ids = set()
+            _new_keyword = str_tags - set(t.name for t in existing)
+            for new_tag in list(_new_keyword):
                 new_tag = escape(new_tag)
                 new_tag_obj = HierarchicalKeyword.add_root(name=new_tag)
                 tag_objs.add(new_tag_obj)
@@ -691,22 +701,12 @@ class ResourceBaseManager(PolymorphicManager):
             remove_thumbs(filename)
 
             # Remove the uploaded sessions, if any
-            try:
-                if 'geonode.upload' in settings.INSTALLED_APPS:
-                    from geonode.upload.models import Upload
-                    # Need to call delete one by one in order to invoke the
-                    #  'delete' overridden method
-                    for upload in Upload.objects.filter(resource_id=_resource.get_real_instance().id):
-                        try:
-                            if upload.upload_dir:
-                                if storage_manager.exists(upload.upload_dir):
-                                    storage_manager.delete(upload.upload_dir)
-                                elif os.path.exists(upload.upload_dir):
-                                    shutil.rmtree(upload.upload_dir, ignore_errors=True)
-                        finally:
-                            upload.delete()
-            except Exception as e:
-                logger.exception(e)
+            if 'geonode.upload' in settings.INSTALLED_APPS:
+                from geonode.upload.models import Upload
+                # Need to call delete one by one in order to invoke the
+                #  'delete' overridden method
+                for upload in Upload.objects.filter(resource_id=_resource.get_real_instance().id):
+                    upload.delete()
 
 
 class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
@@ -775,7 +775,7 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
     extra_metadata_help_text = _(
         'Additional metadata, must be in format [ {"metadata_key": "metadata_value"}, {"metadata_key": "metadata_value"} ]')
     # internal fields
-    uuid = models.CharField(max_length=36)
+    uuid = models.CharField(max_length=36, unique=True, default=str(uuid.uuid4))
     title = models.CharField(_('title'), max_length=255, help_text=_(
         'name by which the cited resource is known'))
     abstract = models.TextField(
@@ -797,7 +797,11 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
     contacts = models.ManyToManyField(
         settings.AUTH_USER_MODEL,
         through='ContactRole')
-    alternate = models.CharField(max_length=128, null=True, blank=True)
+    alternate = models.CharField(
+        _('alternate'),
+        max_length=255,
+        null=True,
+        blank=True)
     date = models.DateTimeField(
         _('date'),
         default=now,
@@ -1167,6 +1171,11 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
                 self.polymorphic_ctype.model:
             self.resource_type = self.polymorphic_ctype.model.lower()
 
+        # Resource Updated
+        _notification_sent = False
+        _group_status_changed = False
+        _approval_status_changed = False
+
         if hasattr(self, 'class_name') and (self.pk is None or notify):
             if self.pk is None and (self.title or getattr(self, 'name', None)):
                 # Resource Created
@@ -1176,9 +1185,8 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
                 recipients = get_notification_recipients(notice_type_label, resource=self)
                 send_notification(recipients, notice_type_label, {'resource': self})
             elif self.pk:
-                # Resource Updated
-                _notification_sent = False
-                _approval_status_changed = False
+                # Group has changed
+                _group_status_changed = self.group != ResourceBase.objects.get(pk=self.get_self_resource().pk).group
 
                 # Approval Notifications Here
                 if self.was_approved != self.is_approved:
@@ -1208,10 +1216,6 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
                     recipients = get_notification_recipients(notice_type_label, resource=self)
                     send_notification(recipients, notice_type_label, {'resource': self})
 
-                # Update workflow permissions
-                if _approval_status_changed:
-                    self.set_permissions()
-
         if self.pk is None:
             _initial_value = ResourceBase.objects.aggregate(Max("pk"))['pk__max']
             if not _initial_value:
@@ -1227,7 +1231,13 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
 
             self.pk = self.id = _next_value
 
+        if not self.uuid or len(self.uuid) == 0 or callable(self.uuid):
+            self.uuid = str(uuid.uuid4())
         super().save(*args, **kwargs)
+
+        # Update workflow permissions
+        if _approval_status_changed or _group_status_changed:
+            self.set_permissions(approval_status_changed=_approval_status_changed, group_status_changed=_group_status_changed)
 
     def delete(self, notify=True, *args, **kwargs):
         """
@@ -1302,8 +1312,9 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
         """BBOX is in the format [x0, x1, y0, y1, "EPSG:srid"]. Provides backwards
         compatibility after transition to polygons."""
         if self.ll_bbox_polygon:
-            bbox = BBOXHelper(self.ll_bbox_polygon.extent)
-            return [bbox.xmin, bbox.xmax, bbox.ymin, bbox.ymax, "EPSG:4326"]
+            _bbox = self.ll_bbox_polygon.extent
+            srid = self.ll_bbox_polygon.srid
+            return [_bbox[0], _bbox[2], _bbox[1], _bbox[3], f"EPSG:{srid}"]
         bbox = BBOXHelper.from_xy([-180, 180, -90, 90])
         return [bbox.xmin, bbox.xmax, bbox.ymin, bbox.ymax, "EPSG:4326"]
 
@@ -1482,10 +1493,12 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
         ResourceBase.objects.filter(id=self.id).update(state=state)
         if state == enumerations.STATE_PROCESSED:
             self.clear_dirty_state()
+        elif state == enumerations.STATE_INVALID:
+            self.set_dirty_state()
 
     @property
     def processed(self):
-        return not self.dirty_state
+        return self.state == enumerations.STATE_PROCESSED and not self.dirty_state
 
     @property
     def keyword_csv(self):
@@ -1513,30 +1526,38 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
             [xmin, ymin, xmax, ymax]
         :param srid: srid as string (e.g. 'EPSG:4326' or '4326')
         """
-        bbox_polygon = Polygon.from_bbox(bbox)
-        self.bbox_polygon = bbox_polygon.clone()
-        self.srid = srid
-        if srid == 4326 or srid == "EPSG:4326":
-            self.ll_bbox_polygon = bbox_polygon
-        else:
-            match = re.match(r'^(EPSG:)?(?P<srid>\d{4,6})$', str(srid))
-            bbox_polygon.srid = int(match.group('srid')) if match else 4326
-            try:
-                # self.ll_bbox_polygon = bbox_polygon.transform(4326, clone=True)
-                # self.ll_bbox_polygon = Polygon.from_bbox(
-                #     bbox_to_projection(
-                #         [
-                #             bbox_polygon.extent[0],
-                #             bbox_polygon.extent[2],
-                #             bbox_polygon.extent[1],
-                #             bbox_polygon.extent[3]
-                #         ] + [f'EPSG:{bbox_polygon.srs.srid}']
-                #     )[:-1])
+        try:
+            bbox_polygon = Polygon.from_bbox(bbox)
+            self.bbox_polygon = bbox_polygon.clone()
+            self.srid = srid
+            # This is a trick in order to avoid PostGIS reprojecting the bbox at save time
+            # by assuming the default geometries have 'EPSG:4326' as srid.
+            ResourceBase.objects.filter(id=self.id).update(
+                bbox_polygon=self.bbox_polygon, srid=srid)
+        finally:
+            self.set_ll_bbox_polygon(bbox, srid=srid)
+
+    def set_ll_bbox_polygon(self, bbox, srid="EPSG:4326"):
+        """
+        Set `ll_bbox_polygon` from bbox values.
+
+        :param bbox: list or tuple formatted as
+            [xmin, ymin, xmax, ymax]
+        :param srid: srid as string (e.g. 'EPSG:4326' or '4326')
+        """
+        try:
+            bbox_polygon = Polygon.from_bbox(bbox)
+            if srid == 4326 or srid.upper() == "EPSG:4326":
+                self.ll_bbox_polygon = bbox_polygon
+            else:
+                match = re.match(r'^(EPSG:)?(?P<srid>\d{4,6})$', str(srid))
+                bbox_polygon.srid = int(match.group('srid')) if match else 4326
                 self.ll_bbox_polygon = Polygon.from_bbox(
                     bbox_to_projection(list(bbox_polygon.extent) + [srid])[:-1])
-            except Exception as e:
-                logger.error(e)
-                self.ll_bbox_polygon = bbox_polygon
+            ResourceBase.objects.filter(id=self.id).update(
+                ll_bbox_polygon=self.ll_bbox_polygon)
+        except Exception as e:
+            raise GeoNodeException(e)
 
     def set_bounds_from_bbox(self, bbox, srid):
         """
@@ -1659,7 +1680,7 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
         if legend is None:
             return None
 
-        if legend.count() > 0:
+        if legend.exists():
             if not style_name:
                 return legend.first().url
             else:
@@ -1880,14 +1901,6 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
         except ContactRole.DoesNotExist:
             the_ma = None
         return the_ma
-
-    def handle_moderated_uploads(self):
-        if settings.ADMIN_MODERATE_UPLOADS:
-            self.is_approved = False
-            self.was_approved = False
-        if settings.RESOURCE_PUBLISHING:
-            self.is_published = False
-            self.was_published = False
 
     def add_missing_metadata_author_or_poc(self):
         """

@@ -21,7 +21,7 @@ import json
 import re
 
 from decimal import Decimal
-from uuid import uuid1
+from uuid import uuid4
 from urllib.parse import urljoin, urlparse
 from PIL import Image
 
@@ -87,6 +87,7 @@ from .permissions import (
     IsSelfOrAdminOrReadOnly,
     IsOwnerOrAdmin,
     IsOwnerOrReadOnly,
+    IsManagerEditOrAdmin,
     ResourceBasePermissionsFilter
 )
 from .serializers import (
@@ -164,7 +165,7 @@ class GroupViewSet(DynamicModelViewSet):
     API endpoint that allows gropus to be viewed or edited.
     """
     authentication_classes = [SessionAuthentication, BasicAuthentication, OAuth2Authentication]
-    permission_classes = [IsAuthenticatedOrReadOnly, ]
+    permission_classes = [IsAuthenticatedOrReadOnly, IsManagerEditOrAdmin, ]
     filter_backends = [
         DynamicFilterBackend, DynamicSortingFilter, DynamicSearchFilter
     ]
@@ -224,11 +225,24 @@ class HierarchicalKeywordViewSet(WithDynamicViewSetMixin, ListModelMixin, Retrie
     """
     API endpoint that lists hierarchical keywords.
     """
+
+    def get_queryset(self):
+        resource_keywords = HierarchicalKeyword.resource_keywords_tree(self.request.user)
+
+        def _get_kw_hrefs(keywords, slugs: list = []):
+            for obj in keywords:
+                if obj.get('tags', []):
+                    slugs.append(obj.get('href'))
+                _get_kw_hrefs(obj.get('nodes', []), slugs)
+            return slugs
+
+        slugs = _get_kw_hrefs(resource_keywords)
+        return HierarchicalKeyword.objects.filter(slug__in=slugs)
+
     permission_classes = [AllowAny, ]
     filter_backends = [
         DynamicFilterBackend, DynamicSortingFilter, DynamicSearchFilter
     ]
-    queryset = HierarchicalKeyword.objects.all()
     serializer_class = HierarchicalKeywordSerializer
     pagination_class = GeoNodeApiPagination
 
@@ -298,7 +312,7 @@ class ResourceBaseViewSet(DynamicModelViewSet):
         DynamicFilterBackend, DynamicSortingFilter, DynamicSearchFilter,
         ExtentFilter, ResourceBasePermissionsFilter, FavoriteFilter
     ]
-    queryset = ResourceBase.objects.all().order_by('-date')
+    queryset = ResourceBase.objects.all().order_by('-last_updated')
     serializer_class = ResourceBaseSerializer
     pagination_class = GeoNodeApiPagination
 
@@ -486,7 +500,7 @@ class ResourceBaseViewSet(DynamicModelViewSet):
         url_name="perms-spec",
         methods=['get', 'put', 'patch', 'delete'],
         permission_classes=[
-            IsOwnerOrAdmin,
+            IsAuthenticated
         ])
     def resource_service_permissions(self, request, pk=None):
         """Instructs the Async dispatcher to execute a 'DELETE' or 'UPDATE' on the permissions of a valid 'uuid'
@@ -733,7 +747,7 @@ class ResourceBaseViewSet(DynamicModelViewSet):
             return Response(status=status.HTTP_403_FORBIDDEN)
         try:
             request_params = QueryDict(request.body, mutable=True)
-            uuid = request_params.get('uuid', str(uuid1()))
+            uuid = request_params.get('uuid', str(uuid4()))
             resource_filter = ResourceBase.objects.filter(uuid=uuid)
             _exec_request = ExecutionRequest.objects.create(
                 user=request.user,
@@ -829,7 +843,7 @@ class ResourceBaseViewSet(DynamicModelViewSet):
             return Response(status=status.HTTP_403_FORBIDDEN)
         try:
             request_params = QueryDict(request.body, mutable=True)
-            uuid = request_params.get('uuid', str(uuid1()))
+            uuid = request_params.get('uuid', str(uuid4()))
             resource_filter = ResourceBase.objects.filter(uuid=uuid)
 
             _exec_request = ExecutionRequest.objects.create(

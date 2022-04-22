@@ -26,12 +26,11 @@ from django.conf import settings
 from django.templatetags.static import static
 from django.utils.module_loading import import_string
 
-from geonode.base.bbox_utils import BBOXHelper
 from geonode.documents.models import Document
 from geonode.geoapps.models import GeoApp
 from geonode.maps.models import Map, MapLayer
 from geonode.layers.models import Dataset
-from geonode.utils import OGC_Servers_Handler
+from geonode.geoserver.helpers import ogc_server_settings
 from geonode.utils import get_dataset_name, get_dataset_workspace
 from geonode.thumbs import utils
 from geonode.thumbs.exceptions import ThumbnailError
@@ -44,7 +43,6 @@ def create_gs_thumbnail_geonode(instance, overwrite=False, check_bbox=False):
     """
     Create a thumbnail with a GeoServer request.
     """
-    ogc_server_settings = OGC_Servers_Handler(settings.OGC_SERVER)["default"]
     wms_version = getattr(ogc_server_settings, "WMS_VERSION") or "1.1.1"
 
     create_thumbnail(
@@ -107,19 +105,17 @@ def create_thumbnail(
     target_crs = forced_crs.upper() if forced_crs is not None else "EPSG:3857"
 
     compute_bbox_from_datasets = False
-    is_map_with_datasets = True
+    is_map_with_datasets = False
 
     if isinstance(instance, Map):
-        is_map_with_datasets = MapLayer.objects.filter(map=instance, local=True).exclude(dataset=None).count() > 0
+        is_map_with_datasets = MapLayer.objects.filter(map=instance, local=True).exclude(dataset=None).exists()
     if bbox:
         bbox = utils.clean_bbox(bbox, target_crs)
     elif instance.ll_bbox_polygon:
-        _bbox = BBOXHelper(instance.ll_bbox_polygon.extent)
-        srid = instance.ll_bbox_polygon.srid
-        bbox = [_bbox.xmin, _bbox.xmax, _bbox.ymin, _bbox.ymax, f"EPSG:{srid}"]
-        bbox = utils.clean_bbox(bbox, target_crs)
+        bbox = utils.clean_bbox(instance.ll_bbox, target_crs)
     else:
         compute_bbox_from_datasets = True
+
     # --- define dataset locations ---
     locations, datasets_bbox = _datasets_locations(instance, compute_bbox=compute_bbox_from_datasets, target_crs=target_crs)
 
@@ -259,7 +255,6 @@ def _datasets_locations(
              and a list optionally consisting of 5 elements containing west, east, south, north
              instance's boundaries and CRS
     """
-    ogc_server_settings = OGC_Servers_Handler(settings.OGC_SERVER)["default"]
     locations = []
     bbox = []
     if isinstance(instance, Dataset):
@@ -271,12 +266,14 @@ def _datasets_locations(
             ]
         )
         if compute_bbox:
-            # handle exceeding the area of use of the default thumb's CRS
-            if (
+            if instance.ll_bbox_polygon:
+                bbox = utils.clean_bbox(instance.ll_bbox, target_crs)
+            elif (
                     instance.bbox[-1].upper() != 'EPSG:3857'
                     and target_crs.upper() == 'EPSG:3857'
                     and utils.exceeds_epsg3857_area_of_use(instance.bbox)
             ):
+                # handle exceeding the area of use of the default thumb's CRS
                 bbox = utils.transform_bbox(utils.crop_to_3857_area_of_use(instance.bbox), target_crs)
             else:
                 bbox = utils.transform_bbox(instance.bbox, target_crs)
@@ -295,11 +292,11 @@ def _datasets_locations(
             workspace = get_dataset_workspace(map_dataset)
             map_dataset_style = map_dataset.current_style
 
-            if store and Dataset.objects.filter(store=store, workspace=workspace, name=name).count() > 0:
+            if store and Dataset.objects.filter(store=store, workspace=workspace, name=name).exists():
                 dataset = Dataset.objects.filter(store=store, workspace=workspace, name=name).first()
-            elif workspace and Dataset.objects.filter(workspace=workspace, name=name).count() > 0:
+            elif workspace and Dataset.objects.filter(workspace=workspace, name=name).exists():
                 dataset = Dataset.objects.filter(workspace=workspace, name=name).first()
-            elif Dataset.objects.filter(alternate=map_dataset.name).count() > 0:
+            elif Dataset.objects.filter(alternate=map_dataset.name).exists():
                 dataset = Dataset.objects.filter(alternate=map_dataset.name).first()
             else:
                 logger.warning(f"Dataset for MapLayer {name} was not found. Skipping it in the thumbnail.")
@@ -335,12 +332,14 @@ def _datasets_locations(
                     ])
 
             if compute_bbox:
-                # handle exceeding the area of use of the default thumb's CRS
-                if (
+                if dataset.ll_bbox_polygon:
+                    dataset_bbox = utils.clean_bbox(dataset.ll_bbox, target_crs)
+                elif (
                         dataset.bbox[-1].upper() != 'EPSG:3857'
                         and target_crs.upper() == 'EPSG:3857'
                         and utils.exceeds_epsg3857_area_of_use(dataset.bbox)
                 ):
+                    # handle exceeding the area of use of the default thumb's CRS
                     dataset_bbox = utils.transform_bbox(utils.crop_to_3857_area_of_use(dataset.bbox), target_crs)
                 else:
                     dataset_bbox = utils.transform_bbox(dataset.bbox, target_crs)

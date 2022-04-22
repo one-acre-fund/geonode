@@ -20,7 +20,6 @@ import os
 import json
 import shutil
 import logging
-import tempfile
 import warnings
 import traceback
 
@@ -36,9 +35,10 @@ from django.template import loader
 from django.views.generic.edit import CreateView, UpdateView
 from django.http import HttpResponse, HttpResponseRedirect, Http404
 from django.core.exceptions import PermissionDenied, ObjectDoesNotExist
+from geonode.base.api.exceptions import geonode_exception_handler
 
 from geonode.client.hooks import hookset
-from geonode.utils import resolve_object
+from geonode.utils import mkdtemp, resolve_object
 from geonode.base.views import batch_modify
 from geonode.people.forms import ProfileForm
 from geonode.base import register_event
@@ -48,7 +48,9 @@ from geonode.monitoring.models import EventType
 from geonode.storage.manager import storage_manager
 from geonode.resource.manager import resource_manager
 from geonode.decorators import check_keyword_write_perms
-from geonode.security.utils import get_user_visible_groups
+from geonode.security.utils import (
+    get_user_visible_groups,
+    AdvancedSecurityWorkflowManager)
 from geonode.base.forms import (
     CategoryForm,
     TKeywordForm,
@@ -137,8 +139,19 @@ def document_embed(request, docid):
 
 
 class DocumentUploadView(CreateView):
-    template_name = 'documents/document_upload.html'
+    http_method_names = ['post']
     form_class = DocumentCreateForm
+
+    def post(self, request, *args, **kwargs):
+        self.object = None
+        try:
+            return super().post(request, *args, **kwargs)
+        except Exception as e:
+            exception_response = geonode_exception_handler(e, {})
+            return HttpResponse(
+                json.dumps(exception_response.data),
+                content_type='application/json',
+                status=exception_response.status_code)
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
@@ -174,7 +187,7 @@ class DocumentUploadView(CreateView):
 
         file = doc_form.pop('doc_file', None)
         if file:
-            tempdir = tempfile.mkdtemp(dir=settings.STATIC_ROOT)
+            tempdir = mkdtemp()
             dirname = os.path.basename(tempdir)
             filepath = storage_manager.save(f"{dirname}/{file.name}", file)
             storage_path = storage_manager.path(filepath)
@@ -199,13 +212,7 @@ class DocumentUploadView(CreateView):
                     title=doc_form.pop('title', None))
             )
 
-        if settings.ADMIN_MODERATE_UPLOADS:
-            self.object.is_approved = False
-            self.object.was_approved = False
-        if settings.RESOURCE_PUBLISHING:
-            self.object.is_published = False
-            self.object.was_published = False
-
+        self.object.handle_moderated_uploads()
         resource_manager.set_permissions(
             None, instance=self.object, permissions=form.cleaned_data["permissions"], created=True
         )
@@ -269,6 +276,17 @@ class DocumentUpdateView(UpdateView):
     queryset = Document.objects.all()
     context_object_name = 'document'
 
+    def post(self, request, *args, **kwargs):
+        self.object = self.get_object()
+        try:
+            return super().post(request, *args, **kwargs)
+        except Exception as e:
+            exception_response = geonode_exception_handler(e, {})
+            return HttpResponse(
+                json.dumps(exception_response.data),
+                content_type='application/json',
+                status=exception_response.status_code)
+
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
         context['ALLOWED_DOC_TYPES'] = ALLOWED_DOC_TYPES
@@ -282,7 +300,7 @@ class DocumentUpdateView(UpdateView):
 
         file = doc_form.pop('doc_file', None)
         if file:
-            tempdir = tempfile.mkdtemp(dir=settings.STATIC_ROOT)
+            tempdir = mkdtemp()
             dirname = os.path.basename(tempdir)
             filepath = storage_manager.save(f"{dirname}/{file.name}", file)
             storage_path = storage_manager.path(filepath)
@@ -477,6 +495,19 @@ def document_metadata(
             tb = traceback.format_exc()
             logger.error(tb)
 
+        vals = {}
+        if 'group' in document_form.changed_data:
+            vals['group'] = document_form.cleaned_data.get('group')
+        if any([x in document_form.changed_data for x in ['is_approved', 'is_published']]):
+            vals['is_approved'] = document_form.cleaned_data.get('is_approved', document.is_approved)
+            vals['is_published'] = document_form.cleaned_data.get('is_published', document.is_published)
+        resource_manager.update(
+            document.uuid,
+            instance=document,
+            notify=True,
+            vals=vals,
+            extra_metadata=json.loads(document_form.cleaned_data['extra_metadata'])
+        )
         return HttpResponse(json.dumps({'message': message}))
     elif request.method == "POST" and (not document_form.is_valid(
     ) or not category_form.is_valid() or not tkeywords_form.is_valid()):
@@ -505,21 +536,10 @@ def document_metadata(
 
     metadata_author_groups = get_user_visible_groups(request.user)
 
-    if settings.ADMIN_MODERATE_UPLOADS:
-        if not request.user.is_superuser:
-            can_change_metadata = request.user.has_perm(
-                'change_resourcebase_metadata',
-                document.get_self_resource())
-            try:
-                is_manager = request.user.groupmember_set.all().filter(role='manager').exists()
-            except Exception:
-                is_manager = False
-            if not is_manager or not can_change_metadata:
-                if settings.RESOURCE_PUBLISHING:
-                    document_form.fields['is_published'].widget.attrs.update(
-                        {'disabled': 'true'})
-                document_form.fields['is_approved'].widget.attrs.update(
-                    {'disabled': 'true'})
+    if not AdvancedSecurityWorkflowManager.is_allowed_to_publish(request.user, document):
+        document_form.fields['is_published'].widget.attrs.update({'disabled': 'true'})
+    if not AdvancedSecurityWorkflowManager.is_allowed_to_approve(request.user, document):
+        document_form.fields['is_approved'].widget.attrs.update({'disabled': 'true'})
 
     register_event(request, EventType.EVENT_VIEW_METADATA, document)
     return render(request, template, context={

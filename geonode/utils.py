@@ -38,15 +38,17 @@ import subprocess
 from lxml import etree
 from osgeo import ogr
 from PIL import Image
+from urllib3 import Retry
 from io import BytesIO, StringIO
 from decimal import Decimal
 from threading import local
 from slugify import slugify
 from contextlib import closing
 from collections import namedtuple, defaultdict
+from rest_framework.exceptions import APIException
 from math import atan, exp, log, pi, sin, tan, floor
 from zipfile import ZipFile, is_zipfile, ZIP_DEFLATED
-from requests.packages.urllib3.util.retry import Retry
+from geonode.upload.api.exceptions import GeneralUploadException
 
 from django.conf import settings
 from django.db.models import signals
@@ -66,8 +68,8 @@ from django.utils.translation import ugettext_lazy as _
 from geonode import geoserver, GeoNodeException  # noqa
 from geonode.compat import ensure_string
 from geonode.layers.enumerations import GXP_PTYPES
-from geonode.services.enumerations import SERVICE_TYPES
 from geonode.storage.manager import storage_manager
+from geonode.services.serviceprocessors import get_available_service_types
 from geonode.base.auth import (
     extend_token,
     get_or_create_token,
@@ -270,15 +272,31 @@ class OGC_Servers_Handler:
         return [self[alias] for alias in self]
 
 
+def mkdtemp(dir=settings.MEDIA_ROOT):
+    if not os.path.exists(dir):
+        os.makedirs(dir, exist_ok=True)
+    tempdir = None
+    while not tempdir:
+        try:
+            tempdir = tempfile.mkdtemp(dir=dir)
+            if os.path.exists(tempdir) and os.path.isdir(tempdir):
+                if os.listdir(tempdir):
+                    raise Exception("Directory is not empty")
+            else:
+                raise Exception("Directory does not exist or is not accessible")
+        except Exception as e:
+            logger.exception(e)
+            tempdir = None
+    return tempdir
+
+
 def unzip_file(upload_file, extension='.shp', tempdir=None):
     """
     Unzips a zipfile into a temporary directory and returns the full path of the .shp file inside (if any)
     """
     absolute_base_file = None
     if tempdir is None:
-        tempdir = tempfile.mkdtemp(dir=settings.STATIC_ROOT)
-    if not os.path.isdir(tempdir):
-        os.makedirs(tempdir)
+        tempdir = mkdtemp()
 
     the_zip = ZipFile(upload_file, allowZip64=True)
     the_zip.extractall(tempdir)
@@ -295,7 +313,7 @@ def extract_tarfile(upload_file, extension='.shp', tempdir=None):
     """
     absolute_base_file = None
     if tempdir is None:
-        tempdir = tempfile.mkdtemp(dir=settings.STATIC_ROOT)
+        tempdir = mkdtemp()
 
     the_tar = tarfile.open(upload_file)
     the_tar.extractall(tempdir)
@@ -516,35 +534,32 @@ def bbox_to_projection(native_bbox, target_srid=4326):
         source_srid = target_srid
 
     if source_srid != target_srid:
-        try:
-            wkt = bbox_to_wkt(_v(minx, x=True, source_srid=source_srid, target_srid=target_srid),
-                              _v(maxx, x=True, source_srid=source_srid, target_srid=target_srid),
-                              _v(miny, x=False, source_srid=source_srid, target_srid=target_srid),
-                              _v(maxy, x=False, source_srid=source_srid, target_srid=target_srid),
-                              srid=source_srid, include_srid=False)
-            # AF: This causses error with GDAL 3.0.4 due to a breaking change on GDAL
-            #     https://code.djangoproject.com/ticket/30645
-            import osgeo.gdal
-            _gdal_ver = osgeo.gdal.__version__.split(".", 2)
-            from osgeo import ogr
-            from osgeo.osr import SpatialReference, CoordinateTransformation
-            g = ogr.Geometry(wkt=wkt)
-            source = SpatialReference()
-            source.ImportFromEPSG(source_srid)
-            dest = SpatialReference()
-            dest.ImportFromEPSG(target_srid)
-            if int(_gdal_ver[0]) >= 3 and \
-                    ((int(_gdal_ver[1]) == 0 and int(_gdal_ver[2]) >= 4) or int(_gdal_ver[1]) > 0):
-                source.SetAxisMappingStrategy(0)
-                dest.SetAxisMappingStrategy(0)
-            g.Transform(CoordinateTransformation(source, dest))
-            projected_bbox = [str(x) for x in g.GetEnvelope()]
-            # Must be in the form : [x0, x1, y0, y1, EPSG:<target_srid>)
-            return tuple(
-                [float(projected_bbox[0]), float(projected_bbox[1]), float(projected_bbox[2]), float(projected_bbox[3])]) + \
-                (f"EPSG:{target_srid}",)
-        except Exception as e:
-            logger.exception(e)
+        wkt = bbox_to_wkt(_v(minx, x=True, source_srid=source_srid, target_srid=target_srid),
+                          _v(maxx, x=True, source_srid=source_srid, target_srid=target_srid),
+                          _v(miny, x=False, source_srid=source_srid, target_srid=target_srid),
+                          _v(maxy, x=False, source_srid=source_srid, target_srid=target_srid),
+                          srid=source_srid, include_srid=False)
+        # AF: This causses error with GDAL 3.0.4 due to a breaking change on GDAL
+        #     https://code.djangoproject.com/ticket/30645
+        import osgeo.gdal
+        _gdal_ver = osgeo.gdal.__version__.split(".", 2)
+        from osgeo import ogr
+        from osgeo.osr import SpatialReference, CoordinateTransformation
+        g = ogr.Geometry(wkt=wkt)
+        source = SpatialReference()
+        source.ImportFromEPSG(source_srid)
+        dest = SpatialReference()
+        dest.ImportFromEPSG(target_srid)
+        if int(_gdal_ver[0]) >= 3 and \
+                ((int(_gdal_ver[1]) == 0 and int(_gdal_ver[2]) >= 4) or int(_gdal_ver[1]) > 0):
+            source.SetAxisMappingStrategy(0)
+            dest.SetAxisMappingStrategy(0)
+        g.Transform(CoordinateTransformation(source, dest))
+        projected_bbox = [str(x) for x in g.GetEnvelope()]
+        # Must be in the form : [x0, x1, y0, y1, EPSG:<target_srid>)
+        return tuple(
+            [float(projected_bbox[0]), float(projected_bbox[1]), float(projected_bbox[2]), float(projected_bbox[3])]) + \
+            (f"EPSG:{target_srid}",)
 
     return native_bbox
 
@@ -716,6 +731,8 @@ def json_response(body=None, errors=None, url=None, redirect_to=None, exception=
             'url': url
         }
     elif exception:
+        if isinstance(exception, APIException):
+            raise exception
         if body is None:
             body = f"Unexpected exception {exception}"
         else:
@@ -724,6 +741,7 @@ def json_response(body=None, errors=None, url=None, redirect_to=None, exception=
             'success': False,
             'errors': [body]
         }
+        raise GeneralUploadException(detail=body)
     elif body:
         pass
     else:
@@ -861,88 +879,83 @@ def fixup_shp_columnnames(inShapefile, charset, tempdir=None):
     """ Try to fix column names and warn the user
     """
     charset = charset if charset and 'undefined' not in charset else 'UTF-8'
+    if not tempdir:
+        tempdir = mkdtemp()
 
+    if is_zipfile(inShapefile):
+        inShapefile = unzip_file(inShapefile, '.shp', tempdir=tempdir)
+
+    inDriver = ogr.GetDriverByName('ESRI Shapefile')
     try:
-        if not tempdir:
-            tempdir = tempfile.mkdtemp(dir=settings.STATIC_ROOT)
+        inDataSource = inDriver.Open(inShapefile, 1)
+    except Exception:
+        tb = traceback.format_exc()
+        logger.debug(tb)
+        inDataSource = None
 
-        if is_zipfile(inShapefile):
-            inShapefile = unzip_file(inShapefile, '.shp', tempdir=tempdir)
+    if inDataSource is None:
+        logger.debug(f"Could not open {inShapefile}")
+        return False, None, None
+    else:
+        inLayer = inDataSource.GetLayer()
 
-        inDriver = ogr.GetDriverByName('ESRI Shapefile')
+    # TODO we may need to improve this regexp
+    # first character must be any letter or "_"
+    # following characters can be any letter, number, "#", ":"
+    regex = r'^[a-zA-Z,_][a-zA-Z,_#:\d]*$'
+    a = re.compile(regex)
+    regex_first_char = r'[a-zA-Z,_]{1}'
+    b = re.compile(regex_first_char)
+    inLayerDefn = inLayer.GetLayerDefn()
+
+    list_col_original = []
+    list_col = {}
+
+    for i in range(inLayerDefn.GetFieldCount()):
         try:
-            inDataSource = inDriver.Open(inShapefile, 1)
-        except Exception:
-            tb = traceback.format_exc()
-            logger.debug(tb)
-            inDataSource = None
-
-        if inDataSource is None:
-            logger.debug(f"Could not open {inShapefile}")
-            return False, None, None
-        else:
-            inLayer = inDataSource.GetLayer()
-
-        # TODO we may need to improve this regexp
-        # first character must be any letter or "_"
-        # following characters can be any letter, number, "#", ":"
-        regex = r'^[a-zA-Z,_][a-zA-Z,_#:\d]*$'
-        a = re.compile(regex)
-        regex_first_char = r'[a-zA-Z,_]{1}'
-        b = re.compile(regex_first_char)
-        inLayerDefn = inLayer.GetLayerDefn()
-
-        list_col_original = []
-        list_col = {}
-
-        for i in range(inLayerDefn.GetFieldCount()):
-            try:
-                field_name = inLayerDefn.GetFieldDefn(i).GetName()
-                if a.match(field_name):
-                    list_col_original.append(field_name)
-            except Exception as e:
-                logger.exception(e)
-                return True, None, None
-
-        for i in range(inLayerDefn.GetFieldCount()):
-            try:
-                field_name = inLayerDefn.GetFieldDefn(i).GetName()
-                if not a.match(field_name):
-                    # once the field_name contains Chinese, to use slugify_zh
-                    if any('\u4e00' <= ch <= '\u9fff' for ch in field_name):
-                        new_field_name = slugify_zh(field_name, separator='_')
-                    else:
-                        new_field_name = slugify(field_name)
-                    if not b.match(new_field_name):
-                        new_field_name = f"_{new_field_name}"
-                    j = 0
-                    while new_field_name in list_col_original or new_field_name in list_col.values():
-                        if j == 0:
-                            new_field_name += '_0'
-                        if new_field_name.endswith(f"_{str(j)}"):
-                            j += 1
-                            new_field_name = f"{new_field_name[:-2]}_{str(j)}"
-                    if field_name != new_field_name:
-                        list_col[field_name] = new_field_name
-            except Exception as e:
-                logger.exception(e)
-                return True, None, None
-
-        if len(list_col) == 0:
+            field_name = inLayerDefn.GetFieldDefn(i).GetName()
+            if a.match(field_name):
+                list_col_original.append(field_name)
+        except Exception as e:
+            logger.exception(e)
             return True, None, None
-        else:
-            try:
-                rename_shp_columnnames(inLayer, list_col)
-                inDataSource.SyncToDisk()
-                inDataSource.Destroy()
-            except Exception as e:
-                logger.exception(e)
-                raise GeoNodeException(
-                    f"Could not decode SHAPEFILE attributes by using the specified charset '{charset}'.")
-        return True, None, list_col
-    finally:
-        if tempdir is not None:
-            shutil.rmtree(tempdir, ignore_errors=True)
+
+    for i in range(inLayerDefn.GetFieldCount()):
+        try:
+            field_name = inLayerDefn.GetFieldDefn(i).GetName()
+            if not a.match(field_name):
+                # once the field_name contains Chinese, to use slugify_zh
+                if any('\u4e00' <= ch <= '\u9fff' for ch in field_name):
+                    new_field_name = slugify_zh(field_name, separator='_')
+                else:
+                    new_field_name = slugify(field_name)
+                if not b.match(new_field_name):
+                    new_field_name = f"_{new_field_name}"
+                j = 0
+                while new_field_name in list_col_original or new_field_name in list_col.values():
+                    if j == 0:
+                        new_field_name += '_0'
+                    if new_field_name.endswith(f"_{str(j)}"):
+                        j += 1
+                        new_field_name = f"{new_field_name[:-2]}_{str(j)}"
+                if field_name != new_field_name:
+                    list_col[field_name] = new_field_name
+        except Exception as e:
+            logger.exception(e)
+            return True, None, None
+
+    if len(list_col) == 0:
+        return True, None, None
+    else:
+        try:
+            rename_shp_columnnames(inLayer, list_col)
+            inDataSource.SyncToDisk()
+            inDataSource.Destroy()
+        except Exception as e:
+            logger.exception(e)
+            raise GeoNodeException(
+                f"Could not decode SHAPEFILE attributes by using the specified charset '{charset}'.")
+    return True, None, list_col
 
 
 def id_to_obj(id_):
@@ -1271,7 +1284,7 @@ def copy_tree(src, dst, symlinks=False, ignore=None):
 def extract_archive(zip_file, dst):
     target_folder = os.path.join(dst, os.path.splitext(os.path.basename(zip_file))[0])
     if not os.path.exists(target_folder):
-        os.makedirs(target_folder)
+        os.makedirs(target_folder, exist_ok=True)
 
     with ZipFile(zip_file, "r", allowZip64=True) as z:
         z.extractall(target_folder)
@@ -1394,7 +1407,16 @@ def set_resource_default_links(instance, layer, prune=False, **kwargs):
                 if gs_resource:
                     srid = gs_resource.projection
                     bbox = gs_resource.native_bbox
-                    instance.set_bbox_polygon([bbox[0], bbox[2], bbox[1], bbox[3]], srid)
+                    ll_bbox = gs_resource.latlon_bbox
+                    try:
+                        instance.set_bbox_polygon([bbox[0], bbox[2], bbox[1], bbox[3]], srid)
+                    except GeoNodeException as e:
+                        if not ll_bbox:
+                            raise
+                        else:
+                            logger.exception(e)
+                            instance.srid = 'EPSG:4326'
+                    instance.set_ll_bbox_polygon([ll_bbox[0], ll_bbox[2], ll_bbox[1], ll_bbox[3]])
                     if instance.srid:
                         instance.srid_url = f"http://www.spatialreference.org/ref/{instance.srid.replace(':', '/').lower()}/"
                     elif instance.bbox_polygon is not None:
@@ -1402,41 +1424,6 @@ def set_resource_default_links(instance, layer, prune=False, **kwargs):
                         instance.srid = 'EPSG:4326'
                     else:
                         raise GeoNodeException(_("Invalid Projection. Dataset is missing CRS!"))
-
-                    from geonode.layers.models import Dataset
-                    try:
-                        with transaction.atomic():
-                            # Dealing with the BBOX: this is a trick to let GeoDjango storing original coordinates
-                            instance.set_bbox_polygon([bbox[0], bbox[2], bbox[1], bbox[3]], 'EPSG:4326')
-                            Dataset.objects.filter(id=instance.id).update(
-                                bbox_polygon=instance.bbox_polygon, srid=srid)
-
-                            # Refresh from DB
-                            instance.refresh_from_db()
-                    except Exception as e:
-                        logger.exception(e)
-
-                    try:
-                        with transaction.atomic():
-                            match = re.match(r'^(EPSG:)?(?P<srid>\d{4,6})$', str(srid))
-                            instance.bbox_polygon.srid = int(match.group('srid')) if match else 4326
-                            Dataset.objects.filter(id=instance.id).update(
-                                ll_bbox_polygon=instance.bbox_polygon, srid=srid)
-
-                            # Refresh from DB
-                            instance.refresh_from_db()
-                    except Exception as e:
-                        logger.warning(e)
-                        try:
-                            with transaction.atomic():
-                                instance.bbox_polygon.srid = 4326
-                                Dataset.objects.filter(id=instance.id).update(
-                                    ll_bbox_polygon=instance.bbox_polygon, srid=srid)
-
-                                # Refresh from DB
-                                instance.refresh_from_db()
-                        except Exception as e:
-                            logger.warning(e)
                     dx = float(bbox[1]) - float(bbox[0])
                     dy = float(bbox[3]) - float(bbox[2])
                     dataAspect = 1 if dy == 0 else dx / dy
@@ -1540,22 +1527,21 @@ def set_resource_default_links(instance, layer, prune=False, **kwargs):
             """
             links = wcs_links(instance_ows_url,
                               instance.alternate)
-
-        for ext, name, mime, wcs_url in links:
-            if (Link.objects.filter(resource=instance.resourcebase_ptr,
-                                    url=wcs_url,
-                                    name=name,
-                                    link_type='data').count() < 2):
-                Link.objects.update_or_create(
-                    resource=instance.resourcebase_ptr,
-                    url=wcs_url,
-                    name=name,
-                    link_type='data',
-                    defaults=dict(
-                        extension=ext,
-                        mime=mime,
+            for ext, name, mime, wcs_url in links:
+                if (Link.objects.filter(resource=instance.resourcebase_ptr,
+                                        url=wcs_url,
+                                        name=name,
+                                        link_type='data').count() < 2):
+                    Link.objects.update_or_create(
+                        resource=instance.resourcebase_ptr,
+                        url=wcs_url,
+                        name=name,
+                        link_type='data',
+                        defaults=dict(
+                            extension=ext,
+                            mime=mime,
+                        )
                     )
-                )
 
         site_url = settings.SITEURL.rstrip('/') if settings.SITEURL.startswith('http') else settings.SITEURL
         html_link_url = f'{site_url}{instance.get_absolute_url()}'
@@ -1598,7 +1584,7 @@ def set_resource_default_links(instance, layer, prune=False, **kwargs):
                                 )
                             )
             else:
-                from geonode.services.serviceprocessors.handler import get_service_handler
+                from geonode.services.serviceprocessors import get_service_handler
                 handler = get_service_handler(
                     instance.remote_service.service_url, service_type=instance.remote_service.type)
                 if handler and hasattr(handler, '_create_dataset_legend_link'):
@@ -1677,7 +1663,7 @@ def set_resource_default_links(instance, layer, prune=False, **kwargs):
 
             elif hasattr(instance.get_real_instance(), 'ptype') and instance.get_real_instance().ptype:
                 ptype_link = dict((v, k) for k, v in GXP_PTYPES.items()).get(instance.get_real_instance().ptype)
-                ptype_link_name = dict(SERVICE_TYPES).get(ptype_link)
+                ptype_link_name = get_available_service_types().get(ptype_link)
                 ptype_link_url = instance.ows_url
                 if Link.objects.filter(resource=instance.resourcebase_ptr, name=ptype_link_name, url=ptype_link_url).count() < 2:
                     Link.objects.get_or_create(

@@ -19,10 +19,8 @@
 import re
 import os
 import json
-import shutil
 import logging
 import zipfile
-import tempfile
 import traceback
 
 from osgeo import ogr
@@ -39,9 +37,9 @@ from django.http import HttpResponse, HttpResponseRedirect
 
 from geoserver.catalog import FailedRequestError, ConflictingDataError
 
-from geonode.upload import UploadException
-from geonode.upload.models import UploadSizeLimit
-from geonode.utils import json_response as do_json_response, unzip_file
+from geonode.upload.api.exceptions import GeneralUploadException
+from geonode.upload.models import UploadSizeLimit, UploadParallelismLimit
+from geonode.utils import json_response as do_json_response, unzip_file, mkdtemp
 from geonode.geoserver.helpers import (
     gs_catalog,
     gs_uploader,
@@ -55,8 +53,9 @@ ogr.UseExceptions()
 logger = logging.getLogger(__name__)
 
 
-def _log(msg, *args):
-    logger.debug(msg, *args)
+def _log(msg, *args, level='error'):
+    # this logger is used also for debug purpose with error level
+    getattr(logger, level)(msg, *args)
 
 
 iso8601 = re.compile(r'^(?P<full>((?P<year>\d{4})([/-]?(?P<mon>(0[1-9])|(1[012]))' +
@@ -134,24 +133,6 @@ def json_response(*args, **kw):
     return do_json_response(*args, **kw)
 
 
-def error_response(req, exception=None, errors=None, force_ajax=True):
-    if exception:
-        logger.exception(f'Unexpected error in upload step: {exception}')
-    else:
-        logger.error(f'Upload error response: {errors}')
-    if req.is_ajax() or force_ajax:
-        content_type = 'text/html' if not req.is_ajax() else None
-        return json_response(exception=exception, errors=errors,
-                             content_type=content_type, status=400)
-    # not sure if any responses will (ideally) ever be non-ajax
-    if errors:
-        exception = "<br>".join(errors)
-    return render(
-        req,
-        'upload/dataset_upload_error.html',
-        context={'error_msg': f'Unexpected error : {exception}'})
-
-
 def json_load_byteified(file_handle):
     return _byteify(
         json.load(file_handle, object_hook=_byteify),
@@ -203,7 +184,7 @@ def get_kml_doc(kml_bytes):
 _pages = {
     'shp': ('srs', 'check', 'time', 'run', 'final'),
     'csv': ('csv', 'srs', 'check', 'time', 'run', 'final'),
-    'tif': ('run', 'final'),
+    'tif': ('srs', 'run', 'final'),
     'zip-mosaic': ('run', 'final'),
     'asc': ('run', 'final'),
     'kml': ('run', 'final'),
@@ -294,6 +275,16 @@ def _advance_step(req, upload_session):
 
 def next_step_response(req, upload_session, force_ajax=True):
     _force_ajax = '&force_ajax=true' if req and force_ajax and 'force_ajax' not in req.GET else ''
+    if not upload_session:
+        return json_response(
+            {
+                'status': 'error',
+                'success': False,
+                'id': None,
+                'error_msg': 'No Upload Session provided.',
+            }
+        )
+
     import_session = upload_session.import_session
     # if the current step is the view POST for this step, advance one
     if req and req.method == 'POST':
@@ -314,7 +305,7 @@ def next_step_response(req, upload_session, force_ajax=True):
             }
         )
 
-    if next == 'check':
+    if next == 'check' and import_session.tasks:
         store_type = import_session.tasks[0].target.store_type
         if store_type == 'coverageStore' or _force_ajax:
             # @TODO we skip time steps for coverages currently
@@ -332,7 +323,7 @@ def next_step_response(req, upload_session, force_ajax=True):
                 }
             )
 
-    if next == 'time':
+    if next == 'time' and import_session.tasks:
         store_type = import_session.tasks[0].target.store_type
         layer = import_session.tasks[0].layer
         (has_time_dim, dataset_values) = dataset_eligible_for_time_dimension(
@@ -401,7 +392,7 @@ def next_step_response(req, upload_session, force_ajax=True):
 
     # @todo this is not handled cleanly - run is not a real step in that it
     # has no corresponding view served by the 'view' function.
-    if next == 'run':
+    if next == 'run' and import_session.tasks:
         upload_session.completed_step = next
         if (_ASYNC_UPLOAD and not req) or (req and req.is_ajax()):
             return run_response(req, upload_session)
@@ -525,35 +516,21 @@ def _get_time_dimensions(layer, upload_session, values=None):
 
 
 def _fixup_base_file(absolute_base_file, tempdir=None):
-    tempdir_was_created = False
     if not tempdir or not os.path.exists(tempdir):
-        tempdir = tempfile.mkdtemp(dir=settings.STATIC_ROOT)
-        tempdir_was_created = True
-    try:
-        if not os.path.isfile(absolute_base_file):
-            tmp_files = [f for f in os.listdir(tempdir) if os.path.isfile(os.path.join(tempdir, f))]
-            for f in tmp_files:
-                if zipfile.is_zipfile(os.path.join(tempdir, f)):
-                    absolute_base_file = unzip_file(os.path.join(tempdir, f), '.shp', tempdir=tempdir)
-                    absolute_base_file = os.path.join(tempdir,
-                                                      absolute_base_file)
-        elif zipfile.is_zipfile(absolute_base_file):
-            absolute_base_file = unzip_file(absolute_base_file,
-                                            '.shp', tempdir=tempdir)
-            absolute_base_file = os.path.join(tempdir,
-                                              absolute_base_file)
-        if os.path.exists(absolute_base_file):
-            return absolute_base_file
-        else:
-            raise Exception(_(f'File does not exist: {absolute_base_file}'))
-    finally:
-        if tempdir_was_created:
-            # Get rid if temporary files that have been uploaded via Upload form
-            try:
-                logger.debug(f"... Cleaning up the temporary folders {tempdir}")
-                shutil.rmtree(tempdir)
-            except Exception as e:
-                logger.warning(e)
+        tempdir = mkdtemp()
+    if not os.path.isfile(absolute_base_file):
+        tmp_files = [f for f in os.listdir(tempdir) if os.path.isfile(os.path.join(tempdir, f))]
+        for f in tmp_files:
+            if zipfile.is_zipfile(os.path.join(tempdir, f)):
+                absolute_base_file = unzip_file(os.path.join(tempdir, f), '.shp', tempdir=tempdir)
+                absolute_base_file = os.path.join(tempdir, absolute_base_file)
+    elif zipfile.is_zipfile(absolute_base_file):
+        absolute_base_file = unzip_file(absolute_base_file, '.shp', tempdir=tempdir)
+        absolute_base_file = os.path.join(tempdir, absolute_base_file)
+    if os.path.exists(absolute_base_file):
+        return absolute_base_file
+    else:
+        raise Exception(_(f'File does not exist: {absolute_base_file}'))
 
 
 def _get_dataset_values(layer, upload_session, expand=0):
@@ -606,45 +583,47 @@ def run_import(upload_session, async_upload=_ASYNC_UPLOAD):
     # run_import can raise an exception which callers should handle
     import_session = upload_session.import_session
     import_session = gs_uploader.get_session(import_session.id)
-    task = import_session.tasks[0]
-    import_execution_requested = False
-    if import_session.state == 'INCOMPLETE':
-        if task.state != 'ERROR':
-            raise Exception(_(f'unknown item state: {task.state}'))
-    elif import_session.state == 'PENDING' and task.target.store_type == 'coverageStore':
-        if task.state == 'READY':
+    if import_session.tasks:
+        task = import_session.tasks[0]
+        import_execution_requested = False
+        if import_session.state == 'INCOMPLETE':
+            if task.state != 'ERROR':
+                raise Exception(_(f'unknown item state: {task.state}'))
+        elif import_session.state == 'PENDING' and task.target.store_type == 'coverageStore':
+            if task.state == 'READY':
+                _log(f"run_import: async_upload[{async_upload}] Commit Import Session {import_session.id} - target: / - alternate: {task.get_target_layer_name()}")
+                import_session.commit(async_upload)
+                import_execution_requested = True
+            if task.state == 'ERROR':
+                progress = task.get_progress()
+                raise Exception(_(f"error during import: {progress.get('message')}"))
+
+        # if a target datastore is configured, ensure the datastore exists
+        # in geoserver and set the uploader target appropriately
+        if ogc_server_settings.datastore_db and task.target.store_type != 'coverageStore':
+            target = create_geoserver_db_featurestore(
+                # store_name=ogc_server_settings.DATASTORE,
+                store_name=ogc_server_settings.datastore_db['NAME'],
+                workspace=settings.DEFAULT_WORKSPACE
+            )
+            _log(f'run_import: Setting target datastore {target.name} {target.workspace.name}')
+            task.set_target(target.name, target.workspace.name)
+        else:
+            target = task.target
+
+        if upload_session.update_mode:
+            _log(f'setting updateMode to {upload_session.update_mode}')
+            task.set_update_mode(upload_session.update_mode)
+
+        _log(f'run_import: Running Import Session {import_session.id}')
+        # run async if using a database
+        if not import_execution_requested:
             import_session.commit(async_upload)
-            import_execution_requested = True
-        if task.state == 'ERROR':
-            progress = task.get_progress()
-            raise Exception(_(f"error during import: {progress.get('message')}"))
 
-    # if a target datastore is configured, ensure the datastore exists
-    # in geoserver and set the uploader target appropriately
-    if ogc_server_settings.datastore_db and task.target.store_type != 'coverageStore':
-        target = create_geoserver_db_featurestore(
-            # store_name=ogc_server_settings.DATASTORE,
-            store_name=ogc_server_settings.datastore_db['NAME'],
-            workspace=settings.DEFAULT_WORKSPACE
-        )
-        _log(
-            f'setting target datastore {target.name} {target.workspace.name}')
-        task.set_target(target.name, target.workspace.name)
-    else:
-        target = task.target
-
-    if upload_session.update_mode:
-        _log(f'setting updateMode to {upload_session.update_mode}')
-        task.set_update_mode(upload_session.update_mode)
-
-    _log('running import session')
-    # run async if using a database
-    if not import_execution_requested:
-        import_session.commit(async_upload)
-
-    # @todo check status of import session - it may fail, but due to protocol,
-    # this will not be reported during the commit
-    return target
+        # @todo check status of import session - it may fail, but due to protocol,
+        # this will not be reported during the commit
+        return target
+    return None
 
 
 def progress_redirect(step, upload_id):
@@ -672,6 +651,14 @@ def get_max_upload_size(slug):
     except ObjectDoesNotExist:
         max_size = getattr(settings, "DEFAULT_MAX_UPLOAD_SIZE", 104857600)
     return max_size
+
+
+def get_max_upload_parallelism_limit(slug):
+    try:
+        max_number = UploadParallelismLimit.objects.get(slug=slug).max_number
+    except ObjectDoesNotExist:
+        max_number = getattr(settings, "DEFAULT_MAX_PARALLEL_UPLOADS_PER_USER", 5)
+    return max_number
 
 
 """
@@ -732,7 +719,7 @@ def import_imagemosaic_granules(
 
     # 0. A Time Regex is mandartory to validate the files
     if not mosaic_time_regex:
-        raise UploadException(_("Could not find any valid Time Regex for the Mosaic files."))
+        raise GeneralUploadException(detail=_("Could not find any valid Time Regex for the Mosaic files."))
 
     for spatial_file in spatial_files:
         f = spatial_file.base_file
@@ -763,7 +750,7 @@ def import_imagemosaic_granules(
         'postgis' in db['ENGINE'] else db['ENGINE']
 
     if not db_engine == 'postgis':
-        raise UploadException(_("Unsupported DataBase for Mosaics!"))
+        raise GeneralUploadException(detail=_("Unsupported DataBase for Mosaics!"))
 
     # dsname = ogc_server_settings.DATASTORE
     dsname = db['NAME']
@@ -795,7 +782,7 @@ def import_imagemosaic_granules(
         ds_exists = (ds is not None)
 
     if not ds_exists:
-        raise UploadException(_("Unsupported DataBase for Mosaics!"))
+        raise GeneralUploadException(detail=_("Unsupported DataBase for Mosaics!"))
 
     context = {
         "abs_path_flag": "True",

@@ -17,6 +17,7 @@
 #
 #########################################################################
 import os
+import json
 import argparse
 import datetime
 import requests
@@ -136,8 +137,9 @@ class GeoNodeUploader:
                             files[name] = (os.path.basename(value.name), value)
                             params[name] = os.path.basename(value.name)
 
+                    params["non_interactive"] = 'true'
                     response = client.post(
-                        urljoin(self.host, "/api/v2/uploads/upload_legacy/"),
+                        urljoin(self.host, "/api/v2/uploads/upload/"),
                         auth=HTTPBasicAuth(self.username, self.password),
                         data=params,
                         files=files,
@@ -148,23 +150,19 @@ class GeoNodeUploader:
                     params["tif_file"].close()
 
                 try:
+                    if response.status_code in [500, 400, 403]:
+                        raise Exception(response.content)
                     data = response.json()
-                    if data['status'] == 'finished':
+                    if not data.get('status', None):
+                        raise Exception(data)
+                    if data.get('status', '') == 'finished':
                         if data['success']:
                             success.append(file)
                         else:
                             errors.append(file)
-                    elif 'redirect_to' in data:
-                        import_id = int(data["redirect_to"].split("?id=")[1].split("&")[0])
-                        upload_response = client.get(f"{self.host}/api/v2/uploads/")
-                        upload_id = self._get_upload_id(upload_response, import_id)
-                        client.get(f"{self.host}/api/v2/uploads/{upload_id}")
-                        client.get(f"{self.host}/upload/check?id={import_id}")
-                        client.get(f"{self.host}/upload/final?id={import_id}")
-                        success.append(file)
                     else:
                         errors.append(file)
-                except requests.exceptions.JSONDecodeError:
+                except json.JSONDecodeError:
                     traceback.print_exc()
                     errors.append(file)
         return success, errors

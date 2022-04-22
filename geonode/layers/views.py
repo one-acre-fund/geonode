@@ -22,34 +22,38 @@ import json
 import shutil
 import decimal
 import logging
-import tempfile
 import warnings
 import traceback
+from django.urls import reverse
 
 from owslib.wfs import WebFeatureService
+import xml.etree.ElementTree as ET
 
 from django.conf import settings
 
 from django.db.models import F
-from django.http import Http404
+from django.http import Http404, JsonResponse
 from django.contrib import messages
 from django.shortcuts import render
 from django.utils.html import escape
 from django.forms.utils import ErrorList
 from django.contrib.auth import get_user_model
+from django.template.loader import get_template
 from django.utils.translation import ugettext as _
 from django.core.exceptions import PermissionDenied
 from django.forms.models import inlineformset_factory
 from django.template.response import TemplateResponse
 from django.contrib.auth.decorators import login_required
+from django.views.decorators.csrf import csrf_exempt
 from django.http import HttpResponse, HttpResponseRedirect
 from django.views.decorators.clickjacking import xframe_options_exempt
 from django.views.decorators.http import require_http_methods
 
 from geonode import geoserver
 from geonode.layers.metadata import parse_metadata
+from geonode.proxy.views import fetch_response_headers
 from geonode.resource.manager import resource_manager
-from geonode.geoserver.helpers import set_dataset_style
+from geonode.geoserver.helpers import set_dataset_style, wps_format_is_supported
 from geonode.resource.utils import update_resource
 
 from geonode.base.auth import get_or_create_token
@@ -69,21 +73,17 @@ from geonode.layers.models import (
     Dataset,
     Attribute)
 from geonode.layers.utils import (
-    get_files,
-    is_sld_upload_only,
-    is_xml_upload_only,
+    get_files, is_sld_upload_only, is_xml_upload_only,
     validate_input_source)
 from geonode.services.models import Service
 from geonode.base import register_event
 from geonode.monitoring.models import EventType
 from geonode.groups.models import GroupProfile
-from geonode.security.utils import get_user_visible_groups
+from geonode.security.utils import (
+    get_user_visible_groups,
+    AdvancedSecurityWorkflowManager)
 from geonode.people.forms import ProfileForm
-from geonode.utils import (
-    resolve_object,
-    check_ogc_backend,
-    llbbox_to_mercator,
-)
+from geonode.utils import HttpClient, check_ogc_backend, llbbox_to_mercator, resolve_object, mkdtemp
 from geonode.geoserver.helpers import (
     ogc_server_settings,
     select_relevant_files,
@@ -193,33 +193,30 @@ def dataset_upload_metadata(request):
     form = NewLayerUploadForm(request.POST, request.FILES)
 
     if form.is_valid():
-
-        tempdir = tempfile.mkdtemp(dir=settings.STATIC_ROOT)
-
+        tempdir = mkdtemp()
         relevant_files = select_relevant_files(
             ['xml'],
             iter(request.FILES.values())
         )
-
         logger.debug(f"relevant_files: {relevant_files}")
-
         write_uploaded_files_to_disk(tempdir, relevant_files)
-
         base_file = os.path.join(tempdir, form.cleaned_data["base_file"].name)
-
-        name = form.cleaned_data['dataset_title']
-        layer = Dataset.objects.filter(typename=name)
-        if layer.exists():
+        layer = _resolve_dataset(
+                request,
+                form.cleaned_data.get('dataset_title'),
+                'base.change_resourcebase',
+                _PERMISSION_MSG_MODIFY)
+        if layer:
             dataset_uuid, vals, regions, keywords, _ = parse_metadata(
                 open(base_file).read())
-            if dataset_uuid and layer.first().uuid != dataset_uuid:
+            if dataset_uuid and layer.uuid != dataset_uuid:
                 out['success'] = False
                 out['errors'] = "The UUID identifier from the XML Metadata, is different from the one saved"
                 return HttpResponse(
                     json.dumps(out),
                     content_type='application/json',
                     status=404)
-            updated_dataset = update_resource(layer.first(), base_file, regions, keywords, vals)
+            updated_dataset = update_resource(layer, base_file, regions, keywords, vals)
             updated_dataset.save()
             out['status'] = ['finished']
             out['url'] = updated_dataset.get_absolute_url()
@@ -260,50 +257,61 @@ def dataset_upload_metadata(request):
 
 
 def dataset_style_upload(request):
+    out = {}
+    errormsgs = []
+
     form = NewLayerUploadForm(request.POST, request.FILES)
-    body = {}
-    if not form.is_valid():
-        body['success'] = False
-        body['errors'] = form.errors
+
+    if form.is_valid():
+        status_code = 200
+        try:
+            data = form.cleaned_data
+            out = {
+                'success': True,
+                'style': data.get('dataset_title'),
+            }
+
+            layer = _resolve_dataset(
+                request,
+                data.get('dataset_title'),
+                'base.change_resourcebase',
+                _PERMISSION_MSG_MODIFY)
+
+            if layer:
+                sld = request.FILES['sld_file'].read()
+
+                set_dataset_style(layer, data.get('dataset_title'), sld)
+                out['url'] = layer.get_absolute_url()
+                out['bbox'] = layer.bbox_string
+                out['crs'] = {
+                    'type': 'name',
+                    'properties': layer.srid
+                }
+                out['ogc_backend'] = settings.OGC_SERVER['default']['BACKEND']
+                out['status'] = ['finished']
+            else:
+                out['success'] = False
+                out['errors'] = "Dataset selected does not exists"
+                status_code = 404
+        except Exception as e:
+            status_code = 500
+            out['success'] = False
+            out['errors'] = str(e.args[0])
+
         return HttpResponse(
-            json.dumps(body),
+            json.dumps(out),
             content_type='application/json',
-            status=500)
-
-    status_code = 200
-    try:
-        data = form.cleaned_data
-        body = {
-            'success': True,
-            'style': data.get('dataset_title'),
-        }
-
-        layer = _resolve_dataset(
-            request,
-            data.get('dataset_title'),
-            'base.change_resourcebase',
-            _PERMISSION_MSG_MODIFY)
-
-        sld = request.FILES['sld_file'].read()
-
-        set_dataset_style(layer, data.get('dataset_title'), sld)
-        body['url'] = layer.get_absolute_url()
-        body['bbox'] = layer.bbox_string
-        body['crs'] = {
-            'type': 'name',
-            'properties': layer.srid
-        }
-        body['ogc_backend'] = settings.OGC_SERVER['default']['BACKEND']
-        body['status'] = ['finished']
-    except Exception as e:
-        status_code = 500
-        body['success'] = False
-        body['errors'] = str(e.args[0])
+            status=status_code)
+    else:
+        for e in form.errors.values():
+            errormsgs.extend([escape(v) for v in e])
+        out['errors'] = errormsgs
+        out['errormsgs'] = errormsgs
 
     return HttpResponse(
-        json.dumps(body),
+        json.dumps(out),
         content_type='application/json',
-        status=status_code)
+        status=500)
 
 
 def dataset_detail(request, layername, template='datasets/dataset_detail.html'):
@@ -690,7 +698,7 @@ def dataset_metadata(
         from geonode.upload.models import Upload
 
         up_sessions = Upload.objects.filter(resource_id=layer.resourcebase_ptr_id)
-        if up_sessions.count() > 0 and up_sessions[0].user != layer.owner:
+        if up_sessions.exists() and up_sessions[0].user != layer.owner:
             up_sessions.update(user=layer.owner)
 
         register_event(request, EventType.EVENT_CHANGE_METADATA, layer)
@@ -718,30 +726,25 @@ def dataset_metadata(
             tb = traceback.format_exc()
             logger.error(tb)
 
+        vals = {}
+        if 'group' in dataset_form.changed_data:
+            vals['group'] = dataset_form.cleaned_data.get('group')
+        if any([x in dataset_form.changed_data for x in ['is_approved', 'is_published']]):
+            vals['is_approved'] = dataset_form.cleaned_data.get('is_approved', layer.is_approved)
+            vals['is_published'] = dataset_form.cleaned_data.get('is_published', layer.is_published)
         resource_manager.update(
             layer.uuid,
             instance=layer,
             notify=True,
+            vals=vals,
             extra_metadata=json.loads(dataset_form.cleaned_data['extra_metadata'])
         )
         return HttpResponse(json.dumps({'message': message}))
 
-    if settings.ADMIN_MODERATE_UPLOADS:
-        if not request.user.is_superuser:
-            can_change_metadata = request.user.has_perm(
-                'change_resourcebase_metadata',
-                layer.get_self_resource())
-            try:
-                is_manager = request.user.groupmember_set.all().filter(role='manager').exists()
-            except Exception:
-                is_manager = False
-
-            if not is_manager or not can_change_metadata:
-                if settings.RESOURCE_PUBLISHING:
-                    dataset_form.fields['is_published'].widget.attrs.update(
-                        {'disabled': 'true'})
-                dataset_form.fields['is_approved'].widget.attrs.update(
-                    {'disabled': 'true'})
+    if not AdvancedSecurityWorkflowManager.is_allowed_to_publish(request.user, layer):
+        dataset_form.fields['is_published'].widget.attrs.update({'disabled': 'true'})
+    if not AdvancedSecurityWorkflowManager.is_allowed_to_approve(request.user, layer):
+        dataset_form.fields['is_approved'].widget.attrs.update({'disabled': 'true'})
 
     if poc is not None:
         dataset_form.fields['poc'].initial = poc.id
@@ -795,6 +798,89 @@ def dataset_metadata_advanced(request, layername):
         request,
         layername,
         template='datasets/dataset_metadata_advanced.html')
+
+
+@csrf_exempt
+def dataset_download(request, layername):
+    try:
+        dataset = _resolve_dataset(
+            request,
+            layername,
+            'base.download_resourcebase',
+            _PERMISSION_MSG_GENERIC)
+    except Exception as e:
+        raise Http404(Exception(_("Not found"), e))
+
+    if not settings.USE_GEOSERVER:
+        # if GeoServer is not used, we redirect to the proxy download
+        return HttpResponseRedirect(reverse('download', args=[dataset.id]))
+
+    download_format = request.GET.get('export_format')
+
+    if download_format and not wps_format_is_supported(download_format, dataset.subtype):
+        logger.error("The format provided is not valid for the selected resource")
+        return JsonResponse({"error": "The format provided is not valid for the selected resource"}, status=500)
+
+    _format = 'application/zip' if dataset.is_vector() else 'image/tiff'
+    # getting default payload
+    tpl = get_template("geoserver/dataset_download.xml")
+    ctx = {
+        "alternate": dataset.alternate,
+        "download_format": download_format or _format
+    }
+    # applying context for the payload
+    payload = tpl.render(ctx)
+
+    # init of Client
+    client = HttpClient()
+
+    headers = {
+        "Content-type": "application/xml",
+        "Accept": "application/xml"
+    }
+
+    # defining the URL needed fr the download
+    url = f"{settings.OGC_SERVER['default']['LOCATION']}ows?service=WPS&version=1.0.0&REQUEST=Execute"
+    if not request.user.is_anonymous:
+        # define access token for the user
+        access_token = get_or_create_token(request.user)
+        url += f"&access_token={access_token}"
+
+    # request to geoserver
+    response, content = client.request(
+        url=url,
+        data=payload,
+        method="post",
+        headers=headers
+    )
+
+    if response.status_code != 200:
+        logger.error(f"Download dataset exception: error during call with GeoServer: {response.content}")
+        return JsonResponse(
+            {"error": f"Download dataset exception: error during call with GeoServer: {response.content}"},
+            status=500
+        )
+
+    # error handling
+    namespaces = {"ows": "http://www.opengis.net/ows/1.1", "wps": "http://www.opengis.net/wps/1.0.0"}
+    response_type = response.headers.get('Content-Type')
+    if response_type == 'text/xml':
+        # parsing XML for get exception
+        content = ET.fromstring(response.text)
+        exc = content.find('*//ows:Exception', namespaces=namespaces) or content.find('ows:Exception', namespaces=namespaces)
+        if exc:
+            exc_text = exc.find('ows:ExceptionText', namespaces=namespaces)
+            logger.error(f"{exc.attrib.get('exceptionCode')} {exc_text.text}")
+            return JsonResponse({"error": f"{exc.attrib.get('exceptionCode')}: {exc_text.text}"}, status=500)
+
+    return_response = fetch_response_headers(
+        HttpResponse(
+            content=response.content,
+            status=response.status_code,
+            content_type=download_format
+        ), response.headers)
+    return_response.headers['Content-Type'] = download_format or _format
+    return return_response
 
 
 @login_required

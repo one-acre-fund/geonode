@@ -20,15 +20,18 @@
 import os
 import requests
 
+from uuid import uuid4
 from urllib.parse import urlparse
 from unittest.mock import patch, Mock
 from django.core.exceptions import ObjectDoesNotExist
 
-from io import BytesIO
 from PIL import Image
-from guardian.shortcuts import assign_perm, get_perms
+from io import BytesIO
+from guardian.shortcuts import assign_perm
+from geonode.base.populate_test_data import create_single_dataset
 
 from geonode.maps.models import Map
+from geonode.resource.utils import KeywordHandler
 from geonode.thumbs import utils as thumb_utils
 from geonode.base import enumerations
 from geonode.layers.models import Dataset
@@ -36,7 +39,7 @@ from geonode.services.models import Service
 from geonode.documents.models import Document
 from geonode.tests.base import GeoNodeBaseTestSupport
 from geonode.base.templatetags.base_tags import display_change_perms_button
-from geonode.base.utils import OwnerRightsRequestViewUtils, ManageResourceOwnerPermissions
+from geonode.base.utils import OwnerRightsRequestViewUtils
 from geonode.base.models import (
     ResourceBase,
     MenuPlaceholder,
@@ -49,6 +52,7 @@ from geonode.base.models import (
     generate_thesaurus_reference
 )
 from django.conf import settings
+from django.contrib.gis.geos import Polygon
 from django.template import Template, Context
 from django.contrib.auth import get_user_model
 from geonode.storage.manager import storage_manager
@@ -79,7 +83,7 @@ class ThumbnailTests(GeoNodeBaseTestSupport):
 
     def setUp(self):
         super().setUp()
-        self.rb = ResourceBase.objects.create(owner=get_user_model().objects.get(username='admin'))
+        self.rb = ResourceBase.objects.create(uuid=str(uuid4()), owner=get_user_model().objects.get(username='admin'))
 
     def tearDown(self):
         super().tearDown()
@@ -645,85 +649,16 @@ class ConfigurationTest(GeoNodeBaseTestSupport):
         self.assertEqual(response.status_code, 503, 'User is allowed to get index page')
 
 
-class TestOwnerPermissionManagement(TestCase):
-    """
-    Only Layers has custom permissions so this is the only model which is tested.
-    Models are always treat in the same way
-    """
-
-    def setUp(self):
-        User = get_user_model()
-        self.user = User.objects.create(username='test', email='test@test.com')
-        self.la = Dataset.objects.create(owner=self.user, title='test', is_approved=True)
-
-    @override_settings(ADMIN_MODERATE_UPLOADS=True)
-    def test_owner_has_no_permissions(self):
-        l_manager = ManageResourceOwnerPermissions(self.la)
-        l_manager.set_owner_permissions_according_to_workflow()
-
-        self.assertEqual(self._retrieve_resource_perms_definition(self.la, ['read', 'download']).sort(),
-                         get_perms(self.user, self.la.get_self_resource()).sort()
-                         )
-
-    @override_settings(ADMIN_MODERATE_UPLOADS=False)
-    def test_user_has_own_permissions(self):
-        l_manager = ManageResourceOwnerPermissions(self.la)
-        l_manager.set_owner_permissions_according_to_workflow()
-
-        self.assertEqual(self._retrieve_resource_perms_definition(self.la).sort(),
-                         get_perms(self.user, self.la.get_self_resource()).sort()
-                         )
-
-    @override_settings(ADMIN_MODERATE_UPLOADS=True)
-    def test_user_has_permissions_restored(self):
-        self.la.is_approved = False
-        self.la.save()
-        l_manager = ManageResourceOwnerPermissions(self.la)
-        l_manager.set_owner_permissions_according_to_workflow()
-
-        self.assertEqual(self._retrieve_resource_perms_definition(self.la).sort(),
-                         get_perms(self.user, self.la.get_self_resource()).sort()
-                         )
-
-    @override_settings(ADMIN_MODERATE_UPLOADS=True)
-    def test_remove_and_add_perms(self):
-        l_manager = ManageResourceOwnerPermissions(self.la)
-        l_manager.set_owner_permissions_according_to_workflow()
-
-        self.assertEqual(self._retrieve_resource_perms_definition(self.la, ['read', 'download']).sort(),
-                         get_perms(self.user, self.la.get_self_resource()).sort()
-                         )
-
-        self.la.is_approved = False
-        self.la.save()
-
-        l_manager.set_owner_permissions_according_to_workflow()
-
-        self.assertEqual(self._retrieve_resource_perms_definition(self.la).sort(),
-                         get_perms(self.user, self.la.get_self_resource()).sort()
-                         )
-
-    def _retrieve_resource_perms_definition(self, resource, perm_key_bundle=[]):
-        ret = []
-        if perm_key_bundle:
-            for key in perm_key_bundle:
-                ret.extend(resource.BASE_PERMISSIONS.get(key, []))
-                ret.extend(resource.PERMISSIONS.get(key, []))
-        else:
-            [ret.extend(r) for r in list(resource.BASE_PERMISSIONS.values()) + list(resource.PERMISSIONS.values())]
-        return ret
-
-
 class TestOwnerRightsRequestUtils(TestCase):
 
     def setUp(self):
         User = get_user_model()
         self.user = User.objects.create(username='test', email='test@test.com')
         self.admin = User.objects.create(username='admin', email='test@test.com', is_superuser=True)
-        self.d = Document.objects.create(owner=self.user, title='test', is_approved=True)
-        self.la = Dataset.objects.create(owner=self.user, title='test', is_approved=True)
-        self.s = Service.objects.create(owner=self.user, title='test', is_approved=True)
-        self.m = Map.objects.create(owner=self.user, title='test', is_approved=True)
+        self.d = Document.objects.create(uuid=str(uuid4()), owner=self.user, title='test', is_approved=True)
+        self.la = Dataset.objects.create(uuid=str(uuid4()), owner=self.user, title='test', is_approved=True)
+        self.s = Service.objects.create(uuid=str(uuid4()), owner=self.user, title='test', is_approved=True)
+        self.m = Map.objects.create(uuid=str(uuid4()), owner=self.user, title='test', is_approved=True)
 
     def test_get_concrete_resource(self):
         self.assertTrue(isinstance(
@@ -772,7 +707,7 @@ class TestGetVisibleResource(TestCase):
     def setUp(self):
         self.user = get_user_model().objects.create(username='mikel_arteta')
         self.category = TopicCategory.objects.create(identifier='biota')
-        self.rb = ResourceBase.objects.create(category=self.category, owner=self.user)
+        self.rb = ResourceBase.objects.create(uuid=str(uuid4()), category=self.category, owner=self.user)
 
     def test_category_data_not_shown_for_missing_resourcebase_permissions(self):
         """
@@ -797,6 +732,30 @@ class TestGetVisibleResource(TestCase):
         """
         self.assertFalse(show_notification('monitoring_alert', self.user))
         self.assertTrue(show_notification('request_download_resourcebase', self.user))
+
+    def test_extent_filter_crossing_dateline(self):
+        from .bbox_utils import filter_bbox
+
+        _ll = None
+        try:
+            bbox = [166.06619, -22.40043, 172.09202, -13.03425]
+            _ll = Dataset.objects.create(
+                uuid=str(uuid4()),
+                owner=self.user,
+                name='test_extent_filter_crossing_dateline',
+                title='test_extent_filter_crossing_dateline',
+                alternate='geonode:test_extent_filter_crossing_dateline',
+                is_approved=True,
+                is_published=True,
+                ll_bbox_polygon=Polygon.from_bbox(bbox)
+            )
+            self.assertListEqual(list(_ll.ll_bbox_polygon.extent), bbox, _ll.ll_bbox_polygon.extent)
+            self.assertTrue(Dataset.objects.filter(title=_ll.title).exists(), Dataset.objects.all())
+            _qs = filter_bbox(Dataset.objects.all(), '-180.0000,-39.7790,-164.2456,9.2702,134.0552,-39.7790,180.0000,9.2702')
+            self.assertTrue(_qs.filter(title=_ll.title), Dataset.objects.all() | _qs.all())
+        finally:
+            if _ll:
+                _ll.delete()
 
 
 class TestHtmlTagRemoval(SimpleTestCase):
@@ -969,31 +928,76 @@ class TestFacets(TestCase):
 
     def setUp(self):
         self.user = get_user_model().objects.create(username='test', email='test@test.com')
-        Dataset.objects.create(
-            owner=self.user, title='test_boxes', abstract='nothing', subtype='vector', is_approved=True
-        )
-        Dataset.objects.create(
-            owner=self.user, title='test_1', abstract='contains boxes', subtype='vector', is_approved=True
-        )
-        Dataset.objects.create(
-            owner=self.user, title='test_2', purpose='contains boxes', subtype='vector', is_approved=True
-        )
-        Dataset.objects.create(
-            owner=self.user, title='test_3', subtype='vector', is_approved=True
-        )
-
-        Dataset.objects.create(
-            owner=self.user, title='test_boxes', abstract='nothing', subtype='raster', is_approved=True
-        )
-        Dataset.objects.create(
-            owner=self.user, title='test_1', abstract='contains boxes', subtype='raster', is_approved=True
-        )
-        Dataset.objects.create(
-            owner=self.user, title='test_2', purpose='contains boxes', subtype='raster', is_approved=True
-        )
-        Dataset.objects.create(
-            owner=self.user, title='test_boxes', subtype='raster', is_approved=True
-        )
+        Dataset.objects.update_or_create(
+            name='test_boxes_vector',
+            defaults=dict(
+                uuid=str(uuid4()),
+                owner=self.user,
+                title='test_boxes',
+                abstract='nothing',
+                subtype='vector',
+                is_approved=True))
+        Dataset.objects.update_or_create(
+            name='test_1_vector',
+            defaults=dict(
+                uuid=str(uuid4()),
+                owner=self.user,
+                title='test_1',
+                abstract='contains boxes',
+                subtype='vector',
+                is_approved=True))
+        Dataset.objects.update_or_create(
+            name='test_2_vector',
+            defaults=dict(
+                uuid=str(uuid4()),
+                owner=self.user,
+                title='test_2',
+                purpose='contains boxes',
+                subtype='vector',
+                is_approved=True))
+        Dataset.objects.update_or_create(
+            name='test_3_vector',
+            defaults=dict(
+                uuid=str(uuid4()),
+                owner=self.user,
+                title='test_3',
+                subtype='vector',
+                is_approved=True))
+        Dataset.objects.update_or_create(
+            name='test_boxes_vector',
+            defaults=dict(
+                uuid=str(uuid4()),
+                owner=self.user,
+                title='test_boxes',
+                abstract='nothing',
+                subtype='vector',
+                is_approved=True))
+        Dataset.objects.update_or_create(
+            name='test_1_raster',
+            defaults=dict(
+                uuid=str(uuid4()),
+                owner=self.user,
+                title='test_1',
+                abstract='contains boxes',
+                subtype='raster',
+                is_approved=True))
+        Dataset.objects.update_or_create(
+            name='test_2_raster',
+            defaults=dict(
+                uuid=str(uuid4()),
+                owner=self.user,
+                title='test_2',
+                purpose='contains boxes',
+                subtype='raster',
+                is_approved=True))
+        Dataset.objects.update_or_create(
+            name='test_boxes_raster',
+            defaults=dict(
+                uuid=str(uuid4()),
+                owner=self.user,
+                title='test_boxes',
+                subtype='raster',
+                is_approved=True))
 
         self.request_mock = Mock(spec=requests.Request, GET=Mock())
 
@@ -1015,7 +1019,7 @@ class TestFacets(TestCase):
         self.request_mock.user = self.user
         results = facets({'request': self.request_mock})
         self.assertEqual(results['vector'], 3)
-        self.assertEqual(results['raster'], 4)
+        self.assertEqual(results['raster'], 3)
 
 
 class TestGenerateThesaurusReference(TestCase):
@@ -1092,3 +1096,72 @@ class TestGenerateThesaurusReference(TestCase):
         '''
         self.assertEqual(expected, actual)
         self.assertEqual(expected, keyword.about)
+
+
+class TestHandleMetadataKeyword(TestCase):
+    fixtures = [
+        "test_thesaurus.json"
+    ]
+
+    def setUp(self):
+        self.keyword = [
+            {
+                "keywords": ["features", "test_dataset"],
+                "thesaurus": {"date": None, "datetype": None, "title": None},
+                "type": "theme",
+            },
+            {
+                "keywords": ["no conditions to access and use"],
+                "thesaurus": {
+                    "date": "2020-10-30T16:58:34",
+                    "datetype": "publication",
+                    "title": "Test for ordering",
+                },
+                "type": None,
+            },
+            {
+                "keywords": ["ad", "af"],
+                "thesaurus": {
+                    "date": "2008-06-01",
+                    "datetype": "publication",
+                    "title": "GEMET - INSPIRE themes, version 1.0",
+                },
+                "type": None,
+            },
+            {"keywords": ["Global"], "thesaurus": {"date": None, "datetype": None, "title": None}, "type": "place"},
+        ]
+        self.dataset = create_single_dataset('keyword-handler')
+        self.sut = KeywordHandler(
+            instance=self.dataset,
+            keywords=self.keyword
+        )
+
+    def test_return_empty_if_keywords_is_an_empty_list(self):
+        setattr(self.sut, 'keywords', [])
+        keyword, thesaurus_keyword = self.sut.handle_metadata_keywords()
+        self.assertListEqual([], keyword)
+        self.assertListEqual([], thesaurus_keyword)
+
+    def test_should_return_the_expected_keyword_extracted_from_raw_and_the_thesaurus_keyword(self):
+        keyword, thesaurus_keyword = self.sut.handle_metadata_keywords()
+        self.assertSetEqual({"features", "test_dataset", "no conditions to access and use"}, set(keyword))
+        self.assertListEqual(["ad", "af"], [x.alt_label for x in thesaurus_keyword])
+
+    def test_should_assign_correclty_the_keyword_to_the_dataset_object(self):
+        self.sut.set_keywords()
+        current_keywords = [keyword.name for keyword in self.dataset.keywords.all()]
+        current_tkeyword = [t.alt_label for t in self.dataset.tkeywords.all()]
+        self.assertSetEqual({"features", "test_dataset", "no conditions to access and use"}, set(current_keywords))
+        self.assertSetEqual({"ad", "af"}, set(current_tkeyword))
+
+    def test_is_thesaurus_available_should_return_queryset_with_existing_thesaurus(self):
+        keyword = "ad"
+        thesaurus = {"title": "GEMET - INSPIRE themes, version 1.0"}
+        actual = self.sut.is_thesaurus_available(thesaurus, keyword)
+        self.assertEqual(1, len(actual))
+
+    def test_is_thesaurus_available_should_return_empty_queryset_for_non_existing_thesaurus(self):
+        keyword = "ad"
+        thesaurus = {"title": "Random Thesaurus Title"}
+        actual = self.sut.is_thesaurus_available(thesaurus, keyword)
+        self.assertEqual(0, len(actual))

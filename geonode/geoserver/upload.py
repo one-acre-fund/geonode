@@ -17,7 +17,6 @@
 #
 #########################################################################
 import uuid
-import shutil
 import logging
 import geoserver
 
@@ -143,10 +142,11 @@ def geoserver_upload(
         logger.warn(msg)
         e.args = (msg,)
         raise
-    finally:
-        if _tmpdir is not None:
-            shutil.rmtree(_tmpdir, ignore_errors=True)
-    logger.debug(f'Finished upload of {name} to GeoServer without errors.')
+    except Exception as e:
+        logger.error("Error during the creation of the resource in GeoServer", exc_info=e)
+        raise e
+
+    logger.debug(f'The File {name} has been sent to GeoServer without errors.')
 
     # Step 5. Create the resource in GeoServer
     logger.debug(f'>>> Step 5. Generating the metadata for {name} after successful import to GeoSever')
@@ -246,7 +246,7 @@ def geoserver_upload(
     # Step 8. Create the Django record for the layer
     logger.debug('>>> Step 8. Creating Django record for [%s]', name)
     alternate = f"{workspace.name}:{gs_resource.name}"
-    dataset_uuid = str(uuid.uuid1())
+    dataset_uuid = str(uuid.uuid4())
 
     defaults = dict(store=gs_resource.store.name,
                     subtype=gs_resource.store.resource_type,

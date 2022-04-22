@@ -16,10 +16,10 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 #
 #########################################################################
+
 import os
 import base64
 import pickle
-import shutil
 import logging
 
 from gsimporter.api import NotFound
@@ -35,6 +35,7 @@ from django.utils.translation import ugettext_lazy as _
 from geonode import GeoNodeException
 from geonode.base import enumerations
 from geonode.base.models import ResourceBase
+from geonode.storage.manager import storage_manager
 from geonode.geoserver.helpers import gs_uploader, ogc_server_settings
 
 logger = logging.getLogger(__name__)
@@ -51,8 +52,8 @@ class UploadManager(models.Manager):
             import_id=upload_session.import_session.id
         ).update(state=enumerations.STATE_INVALID)
 
-    def update_from_session(self, upload_session, resource=None):
-        self.get(
+    def update_from_session(self, upload_session, resource: ResourceBase = None):
+        return self.get(
             user=upload_session.user,
             name=upload_session.name,
             import_id=upload_session.import_session.id).update_from_session(
@@ -66,8 +67,8 @@ class UploadManager(models.Manager):
             state=import_session.state)
 
     def get_incomplete_uploads(self, user):
-        return self.filter(user=user).exclude(
-            state=enumerations.STATE_PROCESSED)
+        return self.filter(user=user).exclude(state=enumerations.STATE_PROCESSED).exclude(
+            state=enumerations.STATE_WAITING)
 
 
 class UploadSizeLimitManager(models.Manager):
@@ -80,17 +81,6 @@ class UploadSizeLimitManager(models.Manager):
         )
         return max_size_db_obj
 
-    def create_default_limit_for_upload_handler(self):
-        max_size_db_obj = UploadSizeLimit.objects.create(
-            slug="file_upload_handler",
-            description=(
-                'Request total size, validated before the upload process. '
-                'This should be greater than "dataset_upload_size".'
-            ),
-            max_size=settings.DEFAULT_MAX_BEFORE_UPLOAD_SIZE,
-        )
-        return max_size_db_obj
-
     def create_default_limit_with_slug(self, slug):
         max_size_db_obj = self.create(
             slug=slug,
@@ -98,6 +88,16 @@ class UploadSizeLimitManager(models.Manager):
             max_size=settings.DEFAULT_MAX_UPLOAD_SIZE,
         )
         return max_size_db_obj
+
+
+class UploadParallelismLimitManager(models.Manager):
+    def create_default_limit(self):
+        default_limit = self.create(
+            slug="default_max_parallel_uploads",
+            description="The default maximum parallel uploads per user.",
+            max_number=settings.DEFAULT_MAX_PARALLEL_UPLOADS_PER_USER,
+        )
+        return default_limit
 
 
 class Upload(models.Model):
@@ -112,7 +112,7 @@ class Upload(models.Model):
     resource = models.ForeignKey(ResourceBase, null=True, on_delete=models.SET_NULL)
     upload_dir = models.TextField(null=True)
     store_spatial_files = models.BooleanField(default=True)
-    name = models.CharField(max_length=64, null=True)
+    name = models.CharField(max_length=64, null=False, blank=False)
     complete = models.BooleanField(default=False)
     # hold our serialized session object
     session = models.TextField(null=True, blank=True)
@@ -149,15 +149,16 @@ class Upload(models.Model):
         if not self.upload_dir:
             self.upload_dir = os.path.dirname(upload_session.base_file)
 
-        if resource and not self.resource:
-            if not isinstance(resource, ResourceBase) and hasattr(resource, 'resourcebase_ptr'):
-                self.resource = resource.resourcebase_ptr
-            elif not isinstance(resource, ResourceBase):
-                raise GeoNodeException("Invalid resource uploaded, plase select one of the available")
-            else:
-                self.resource = resource
+        if resource:
+            if not self.resource:
+                if not isinstance(resource, ResourceBase) and hasattr(resource, 'resourcebase_ptr'):
+                    self.resource = resource.resourcebase_ptr
+                elif not isinstance(resource, ResourceBase):
+                    raise GeoNodeException("Invalid resource uploaded, plase select one of the available")
+                else:
+                    self.resource = resource
 
-            if upload_session.base_file and self.resource and self.resource.title:
+            if upload_session.base_file and len(self.resource.files) == 0:
                 uploaded_files = upload_session.base_file[0]
                 aux_files = uploaded_files.auxillary_files
                 sld_files = uploaded_files.sld_files
@@ -171,19 +172,18 @@ class Upload(models.Model):
                             files=files_to_upload)
                         self.resource.refresh_from_db()
 
-                # Now we delete the files from local file system
-                # only if it does not match with the default temporary path
-                if os.path.exists(self.upload_dir):
-                    if settings.STATIC_ROOT != os.path.dirname(os.path.abspath(self.upload_dir)):
-                        shutil.rmtree(self.upload_dir, ignore_errors=True)
-
-        if "COMPLETE" == self.state:
-            self.complete = True
-        if self.resource and self.resource.processed:
-            self.state = enumerations.STATE_RUNNING
+        if self.resource:
+            if self.resource.processed:
+                self.state = enumerations.STATE_PROCESSED
+            else:
+                self.state = enumerations.STATE_RUNNING
         elif self.state in (enumerations.STATE_READY, enumerations.STATE_PENDING):
             self.state = upload_session.import_session.state
+            if self.state == enumerations.STATE_COMPLETE:
+                self.complete = True
+
         self.save()
+        return self.get_session
 
     @property
     def progress(self):
@@ -195,9 +195,11 @@ class Upload(models.Model):
         elif self.state == enumerations.STATE_WAITING:
             return 50.0
         elif self.state == enumerations.STATE_PROCESSED:
-            return 100.0
+            if self.resource and self.resource.processed:
+                return 100.0
+            return 80.0
         elif self.state in (enumerations.STATE_COMPLETE, enumerations.STATE_RUNNING):
-            if self.resource and self.resource.processed and self.resource.state == enumerations.STATE_PROCESSED:
+            if self.resource and self.resource.state == enumerations.STATE_PROCESSED:
                 self.state = enumerations.STATE_PROCESSED
                 self.save()
                 return 90.0
@@ -227,7 +229,7 @@ class Upload(models.Model):
             if not session or session.state != enumerations.STATE_COMPLETE:
                 session = gs_uploader.get_session(self.import_id)
         except (NotFound, Exception):
-            if self.state not in (enumerations.STATE_COMPLETE, enumerations.STATE_PROCESSED):
+            if not session and self.state not in (enumerations.STATE_COMPLETE, enumerations.STATE_PROCESSED):
                 self.set_processing_state(enumerations.STATE_INVALID)
         if session and self.state != enumerations.STATE_INVALID:
             return f"{ogc_server_settings.LOCATION}rest/imports/{session.id}"
@@ -235,40 +237,14 @@ class Upload(models.Model):
             return None
 
     def get_detail_url(self):
-        if self.resource and self.resource.processed and self.resource.state == enumerations.STATE_PROCESSED:
+        if self.resource and self.resource.processed:
             return getattr(self.resource, 'detail_url', None)
         else:
             return None
 
     def delete(self, *args, **kwargs):
-        importer_locations = []
         super().delete(*args, **kwargs)
-        try:
-            session = gs_uploader.get_session(self.import_id)
-        except (NotFound, Exception):
-            session = None
-        if session:
-            for task in session.tasks:
-                if getattr(task, 'data'):
-                    importer_locations.append(
-                        getattr(task.data, 'location'))
-            try:
-                session.delete()
-            except Exception:
-                logging.warning('error deleting upload session')
-
-        for _location in importer_locations:
-            try:
-                shutil.rmtree(_location)
-            except Exception as e:
-                logger.warning(e)
-
-        # here we are deleting the local that soon will be removed
-        if self.upload_dir and os.path.exists(self.upload_dir):
-            try:
-                shutil.rmtree(self.upload_dir)
-            except Exception as e:
-                logger.warning(e)
+        storage_manager.rmtree(self.upload_dir, ignore_errors=True)
 
     def set_processing_state(self, state):
         if self.state != state:
@@ -276,8 +252,6 @@ class Upload(models.Model):
             Upload.objects.filter(id=self.id).update(state=state)
         if self.resource:
             self.resource.set_processing_state(state)
-            if state != enumerations.STATE_PROCESSED:
-                self.resource.set_dirty_state()
 
     def __str__(self):
         return f'Upload [{self.pk}] gs{self.import_id} - {self.name}, {self.user}'
@@ -312,6 +286,35 @@ class UploadSizeLimit(models.Model):
 
     def __str__(self):
         return f'UploadSizeLimit for "{self.slug}" (max_size: {self.max_size_label})'
+
+    class Meta:
+        ordering = ("slug",)
+
+
+class UploadParallelismLimit(models.Model):
+    objects = UploadParallelismLimitManager()
+
+    slug = models.SlugField(
+        primary_key=True,
+        max_length=255,
+        unique=True,
+        null=False,
+        blank=False,
+        validators=[MinLengthValidator(limit_value=3)],
+    )
+    description = models.TextField(
+        max_length=255,
+        default=None,
+        null=True,
+        blank=True,
+    )
+    max_number = models.PositiveSmallIntegerField(
+        help_text=_("The maximum number of parallel uploads (0 to 32767)."),
+        default=settings.DEFAULT_MAX_PARALLEL_UPLOADS_PER_USER,
+    )
+
+    def __str__(self):
+        return f'UploadParallelismLimit for "{self.slug}" (max_number: {self.max_number})'
 
     class Meta:
         ordering = ("slug",)

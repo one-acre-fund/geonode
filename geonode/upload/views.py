@@ -16,7 +16,6 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 #
 #########################################################################
-
 """
 Provide views for doing an upload.
 
@@ -37,10 +36,12 @@ import re
 import json
 import logging
 import zipfile
+import traceback
 import gsimporter
 
 from http.client import BadStatusLine
 
+from django.conf import settings
 from django.shortcuts import render
 from django.utils.html import escape
 from django.shortcuts import get_object_or_404
@@ -48,9 +49,11 @@ from django.core.exceptions import PermissionDenied
 from django.utils.translation import ugettext_lazy as _
 from django.contrib.auth.decorators import login_required
 
+from geonode.base import enumerations
 from geonode.layers.models import Dataset
-from geonode.upload import UploadException
 from geonode.base.models import Configuration
+from geonode.upload.api.exceptions import GeneralUploadException
+from rest_framework.exceptions import APIException, AuthenticationFailed
 from geonode.utils import fixup_shp_columnnames
 from geonode.decorators import logged_in_or_basicauth
 
@@ -67,15 +70,13 @@ from .models import (
     Upload)
 from .files import (
     get_scan_hint,
-    scan_file
-)
+    scan_file)
 from .utils import (
     _ALLOW_TIME_STEP,
     _SUPPORTED_CRS,
     _geoserver_down_error_msg,
     _get_time_dimensions,
     check_import_session_is_valid,
-    error_response,
     is_async_step,
     is_latitude,
     is_longitude,
@@ -95,8 +96,9 @@ from .upload import (
 logger = logging.getLogger(__name__)
 
 
-def _log(msg, *args):
-    logger.debug(msg, *args)
+def _log(msg, *args, level='error'):
+    # this logger is used also for debug purpose with error level
+    getattr(logger, level)(msg, *args)
 
 
 def _get_upload_session(req):
@@ -126,7 +128,7 @@ def data_upload_progress(req):
 
 
 def save_step_view(req, session):
-    form = LayerUploadForm(req.POST, req.FILES)
+    form = LayerUploadForm(req.POST, req.FILES, user=req.user)
 
     overwrite = req.path_info.endswith('/replace')
     target_store = None
@@ -161,7 +163,7 @@ def save_step_view(req, session):
             name,
             spatial_files,
             overwrite=overwrite,
-            store_spatial_files=form.cleaned_data['store_spatial_files'] or True,
+            store_spatial_files=form.cleaned_data.get('store_spatial_files', True),
             mosaic=form.cleaned_data['mosaic'] or scan_hint == 'zip-mosaic',
             append_to_mosaic_opts=form.cleaned_data['append_to_mosaic_opts'],
             append_to_mosaic_name=form.cleaned_data['append_to_mosaic_name'],
@@ -174,49 +176,52 @@ def save_step_view(req, session):
             charset_encoding=form.cleaned_data["charset"],
             target_store=target_store
         )
-        import_session.tasks[0].set_charset(form.cleaned_data["charset"])
-        sld = None
-        if spatial_files[0].sld_files:
-            sld = spatial_files[0].sld_files[0]
-        if not os.path.isfile(os.path.join(data_retriever.temporary_folder, spatial_files[0].base_file)):
-            tmp_files = [f for f in os.listdir(data_retriever.temporary_folder) if os.path.isfile(os.path.join(data_retriever.temporary_folder, f))]
-            for f in tmp_files:
-                if zipfile.is_zipfile(os.path.join(data_retriever.temporary_folder, f)):
-                    fixup_shp_columnnames(os.path.join(data_retriever.temporary_folder, f),
-                                          form.cleaned_data["charset"],
-                                          tempdir=data_retriever.temporary_folder)
 
-        _log(f'provided sld is {sld}')
-        # upload_type = get_upload_type(base_file)
-        upload_session = UploaderSession(
-            tempdir=data_retriever.temporary_folder,
-            base_file=spatial_files,
-            name=upload.name,
-            charset=form.cleaned_data["charset"],
-            import_session=import_session,
-            dataset_abstract=form.cleaned_data["abstract"],
-            dataset_title=form.cleaned_data["dataset_title"],
-            permissions=form.cleaned_data["permissions"],
-            import_sld_file=sld,
-            spatial_files_uploaded=form.cleaned_data['uploaded'],
-            upload_type=spatial_files[0].file_type.code,
-            time=form.cleaned_data['time'],
-            mosaic=form.cleaned_data['mosaic'],
-            append_to_mosaic_opts=form.cleaned_data['append_to_mosaic_opts'],
-            append_to_mosaic_name=form.cleaned_data['append_to_mosaic_name'],
-            mosaic_time_regex=form.cleaned_data['mosaic_time_regex'],
-            mosaic_time_value=form.cleaned_data['mosaic_time_value'],
-            user=upload.user
-        )
-        Upload.objects.update_from_session(upload_session)
-        return next_step_response(req, upload_session, force_ajax=True)
+        if upload and import_session and import_session.state in (enumerations.STATE_READY, enumerations.STATE_PENDING):
+            import_session.tasks[0].set_charset(form.cleaned_data["charset"])
+            sld = None
+            if spatial_files[0].sld_files:
+                sld = spatial_files[0].sld_files[0]
+            if os.path.exists(data_retriever.temporary_folder):
+                tmp_files = [f for f in data_retriever.get_paths().values() if os.path.exists(f)]
+                for f in tmp_files:
+                    if zipfile.is_zipfile(os.path.join(data_retriever.temporary_folder, f)):
+                        fixup_shp_columnnames(os.path.join(data_retriever.temporary_folder, f),
+                                              form.cleaned_data["charset"],
+                                              tempdir=data_retriever.temporary_folder)
+
+            _log(f'provided sld is {sld}')
+            # upload_type = get_upload_type(base_file)
+            upload_session = UploaderSession(
+                tempdir=data_retriever.temporary_folder,
+                base_file=spatial_files,
+                name=upload.name,
+                charset=form.cleaned_data["charset"],
+                import_session=import_session,
+                dataset_abstract=form.cleaned_data["abstract"],
+                dataset_title=form.cleaned_data["dataset_title"],
+                permissions=form.cleaned_data["permissions"],
+                import_sld_file=sld,
+                spatial_files_uploaded=form.cleaned_data['uploaded'],
+                upload_type=spatial_files[0].file_type.code,
+                time=form.cleaned_data['time'],
+                mosaic=form.cleaned_data['mosaic'],
+                append_to_mosaic_opts=form.cleaned_data['append_to_mosaic_opts'],
+                append_to_mosaic_name=form.cleaned_data['append_to_mosaic_name'],
+                mosaic_time_regex=form.cleaned_data['mosaic_time_regex'],
+                mosaic_time_value=form.cleaned_data['mosaic_time_value'],
+                user=upload.user
+            )
+            upload_session = Upload.objects.update_from_session(upload_session)
+            return next_step_response(req, upload_session, force_ajax=True)
+        return next_step_response(req, None, force_ajax=True)
     else:
         if hasattr(form, "data_retriever"):
             form.data_retriever.delete_files()
         errors = []
         for e in form.errors.values():
             errors.extend([escape(v) for v in e])
-        return error_response(req, errors=errors)
+        raise GeneralUploadException(detail=errors)
 
 
 def srs_step_view(request, upload_session):
@@ -482,8 +487,8 @@ def time_step_view(request, upload_session):
 
     form = create_time_form(request, upload_session, request.POST)
     if not form.is_valid():
-        logger.warning('Invalid upload form: %s', form.errors)
-        return error_response(request, errors=["Invalid Submission"])
+        logger.exception('Invalid upload form: %s', form.errors)
+        raise GeneralUploadException(detail="Invalid Submission")
 
     cleaned = form.cleaned_data
     start_attribute_and_type = cleaned.get('start_attribute', None)
@@ -509,9 +514,9 @@ def time_step_view(request, upload_session):
     try:
         upload_session.import_session = import_session.reload()
     except gsimporter.api.NotFound as e:
+        logger.exception(e)
         Upload.objects.invalidate_from_session(upload_session)
-        raise UploadException.from_exc(
-            _("The GeoServer Import Session is no more available"), e)
+        raise GeneralUploadException(detail=_("The GeoServer Import Session is no more available ") + str(e))
 
     if start_attribute_and_type:
         def tx(type_name):
@@ -540,7 +545,7 @@ def final_step_view(req, upload_session):
     _json_response = None
     if not upload_session:
         upload_session = _get_upload_session(req)
-    if upload_session:
+    if upload_session and getattr(upload_session, 'import_session', None):
         import_session = upload_session.import_session
         _log('Checking session %s validity', import_session.id)
         if not check_import_session_is_valid(
@@ -586,11 +591,12 @@ def final_step_view(req, upload_session):
                 )
                 register_event(req, EventType.EVENT_UPLOAD, saved_dataset)
                 return _json_response
-            except (LayerNotReady, AssertionError):
+            except (LayerNotReady, AssertionError) as e:
+                logger.exception(e)
                 force_ajax = '&force_ajax=true' if req and 'force_ajax' in req.GET and req.GET['force_ajax'] == 'true' else ''
                 return json_response(
                     {
-                        'status': 'pending',
+                        'status': 'running',
                         'success': True,
                         'id': import_session.id,
                         'redirect_to': f"/upload/final?id={import_session.id}{force_ajax}"
@@ -641,7 +647,7 @@ def view(req, step=None):
 
     config = Configuration.load()
     if config.read_only or config.maintenance:
-        return error_response(req, errors=["Not Authorized"])
+        raise AuthenticationFailed()
 
     upload_session = None
     upload_id = req.GET.get('id', None)
@@ -691,60 +697,69 @@ def view(req, step=None):
                     step)
                 upload_session.completed_step = _completed_step
             except Exception as e:
-                logger.warning(e)
-                return error_response(req, errors=e.args)
+                logger.exception(e)
+                if isinstance(e, APIException):
+                    raise e
+                raise GeneralUploadException(detail=traceback.format_exc())
 
         resp = _steps[step](req, upload_session)
         resp_js = None
-        try:
-            if 'json' in resp.headers.get('Content-Type', ''):
-                content = resp.content
-                if isinstance(content, bytes):
-                    content = content.decode('UTF-8')
+        if resp:
+            content = resp.content
+            if isinstance(content, bytes):
+                content = content.decode('UTF-8')
+            try:
                 resp_js = json.loads(content)
-        except Exception as e:
-            logger.warning(e)
-            return error_response(req, errors=e.args)
+            except json.decoder.JSONDecodeError:
+                resp_js = content
+            except Exception as e:
+                logger.exception(e)
+                if isinstance(e, APIException):
+                    raise e
+                raise GeneralUploadException(detail=traceback.format_exc())
 
-        # must be put back to update object in session
-        if upload_session:
-            if resp_js and step == 'final':
-                try:
-                    delete_session = resp_js.get('status') != 'pending'
-                    if delete_session:
-                        # we're done with this session, wax it
-                        upload_session = None
-                        del req.session[upload_id]
-                        req.session.modified = True
-                except Exception:
-                    pass
-        else:
-            upload_session = _get_upload_session(req)
-        if upload_session:
-            Upload.objects.update_from_session(upload_session)
-        if resp_js:
-            _success = resp_js.get('success', False)
-            _redirect_to = resp_js.get('redirect_to', '')
-            _required_input = resp_js.get('required_input', False)
-            if _success and (_required_input or 'upload/final' in _redirect_to):
-                from geonode.upload.tasks import finalize_incomplete_session_uploads
-                finalize_incomplete_session_uploads.apply_async()
+            # must be put back to update object in session
+            if upload_session:
+                if resp_js and step == 'final':
+                    try:
+                        delete_session = resp_js.get('status') != 'pending'
+                        if delete_session:
+                            # we're done with this session, wax it
+                            upload_session = None
+                            del req.session[upload_id]
+                            req.session.modified = True
+                    except Exception:
+                        pass
+            else:
+                upload_session = _get_upload_session(req)
+            if upload_session:
+                upload_session = Upload.objects.update_from_session(upload_session)
+            if not settings.ASYNC_SIGNALS and resp_js and isinstance(resp_js, dict):
+                _success = resp_js.get('success', False)
+                _redirect_to = resp_js.get('redirect_to', '')
+                _required_input = resp_js.get('required_input', False)
+                if _success and (_required_input or 'upload/final' in _redirect_to):
+                    from geonode.upload.tasks import finalize_incomplete_session_uploads
+                    finalize_incomplete_session_uploads.apply()
         return resp
     except BadStatusLine:
         logger.exception('bad status line, geoserver down?')
-        return error_response(req, errors=[_geoserver_down_error_msg])
+        raise GeneralUploadException(detail=_geoserver_down_error_msg)
     except gsimporter.RequestFailed as e:
-        logger.exception('request failed')
+        logger.exception(e)
         errors = e.args
         # http bad gateway or service unavailable
         if int(errors[0]) in (502, 503):
             errors = [_geoserver_down_error_msg]
-        return error_response(req, errors=errors)
+        raise GeneralUploadException(detail=errors)
     except gsimporter.BadRequest as e:
-        logger.exception('bad request')
-        return error_response(req, errors=e.args)
+        logger.exception(e)
+        raise GeneralUploadException(detail=e.args[0])
     except Exception as e:
-        return error_response(req, exception=e)
+        logger.exception(e)
+        if isinstance(e, APIException):
+            raise e
+        raise GeneralUploadException(detail=traceback.format_exc())
 
 
 @login_required

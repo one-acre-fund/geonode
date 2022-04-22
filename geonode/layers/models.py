@@ -29,7 +29,7 @@ from django.utils.translation import ugettext_lazy as _
 from tinymce.models import HTMLField
 
 from geonode.client.hooks import hookset
-from geonode.utils import check_shp_columnnames
+from geonode.utils import build_absolute_uri, check_shp_columnnames
 from geonode.security.models import PermissionLevelMixin
 from geonode.groups.conf import settings as groups_settings
 from geonode.security.permissions import (
@@ -128,10 +128,10 @@ class Dataset(ResourceBase):
 
     # internal fields
     objects = DatasetManager()
-    workspace = models.CharField(_('Workspace'), max_length=128)
-    store = models.CharField(_('Store'), max_length=128)
-    name = models.CharField(_('Name'), max_length=128)
-    typename = models.CharField(_('Typename'), max_length=128, null=True, blank=True)
+    workspace = models.CharField(_('Workspace'), max_length=255)
+    store = models.CharField(_('Store'), max_length=255)
+    name = models.CharField(_('Name'), max_length=255)
+    typename = models.CharField(_('Typename'), max_length=255, null=True, blank=True)
     ows_url = models.URLField(
         _('ows URL'),
         null=True,
@@ -153,7 +153,7 @@ class Dataset(ResourceBase):
         _('P-Type'),
         null=False,
         blank=False,
-        max_length=80,
+        max_length=255,
         default="gxp_wmscsource")
 
     default_style = models.ForeignKey(
@@ -183,6 +183,10 @@ class Dataset(ResourceBase):
 
     def is_vector(self):
         return self.subtype == 'vector'
+
+    @property
+    def is_raster(self):
+        return self.subtype == 'raster'
 
     @property
     def display_type(self):
@@ -279,13 +283,18 @@ class Dataset(ResourceBase):
 
     @property
     def embed_url(self):
-        return reverse('dataset_embed', kwargs={'layername': self.service_typename})
+        try:
+            if self.service_typename:
+                return reverse('dataset_embed', kwargs={'layername': self.service_typename})
+        except Exception as e:
+            logger.exception(e)
+            return None
 
     def attribute_config(self):
         # Get custom attribute sort order and labels if any
         cfg = {}
         visible_attributes = self.attribute_set.visible()
-        if (visible_attributes.count() > 0):
+        if (visible_attributes.exists()):
             cfg["getFeatureInfo"] = {
                 "fields": [lyr.attribute for lyr in visible_attributes],
                 "propertyNames": {lyr.attribute: lyr.attribute_label for lyr in visible_attributes},
@@ -307,6 +316,7 @@ class Dataset(ResourceBase):
             ('change_dataset_data', 'Can edit layer data'),
             ('change_dataset_style', 'Can change layer style'),
         )
+        unique_together = ('store', 'workspace', 'name')
 
     # Permission Level Constants
     # LEVEL_NONE inherited
@@ -319,6 +329,13 @@ class Dataset(ResourceBase):
         from geonode.maps.models import Map
         map_ids = list(self.maplayers.values_list('map__id', flat=True))
         return Map.objects.filter(id__in=map_ids)
+
+    @property
+    def download_url(self):
+        if self.subtype not in ['vector', 'raster']:
+            logger.error("Download URL is available only for datasets that have been harvested and copied locally")
+            return None
+        return build_absolute_uri(reverse('dataset_download', args=(self.alternate,)))
 
     @property
     def maplayers(self):

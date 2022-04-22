@@ -16,7 +16,11 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 #
 #########################################################################
+
 import os
+import re
+import shutil
+import logging
 import importlib
 
 from uuid import uuid1
@@ -32,6 +36,8 @@ from . import settings as sm_settings
 from abc import ABCMeta, abstractmethod
 from django.core.files.storage import FileSystemStorage
 
+logger = logging.getLogger(__name__)
+
 
 class StorageManagerInterface(metaclass=ABCMeta):
 
@@ -46,6 +52,37 @@ class StorageManagerInterface(metaclass=ABCMeta):
     @abstractmethod
     def listdir(self, path):
         pass
+
+    def rmtree(self, path, ignore_errors=False):
+        if self.exists(path):
+            _dirs, _files = self.listdir(path)
+            for _entry in _files:
+                _entry_path = os.path.join(path, _entry)
+                if self.exists(_entry_path):
+                    try:
+                        self.delete(_entry_path)
+                    except Exception as e:
+                        if ignore_errors:
+                            logger.exception(e)
+                        else:
+                            raise
+            for _entry in _dirs:
+                _entry_path = os.path.join(path, _entry)
+                if self.exists(_entry_path):
+                    try:
+                        self.delete(_entry_path)
+                    except Exception as e:
+                        if ignore_errors:
+                            logger.exception(e)
+                        else:
+                            raise
+            try:
+                self.delete(path)
+            except Exception as e:
+                if ignore_errors:
+                    logger.exception(e)
+                else:
+                    raise
 
     @abstractmethod
     def open(self, name, mode='rb'):
@@ -99,6 +136,9 @@ class StorageManager(StorageManagerInterface):
     def listdir(self, path):
         return self._concrete_storage_manager.listdir(path)
 
+    def rmtree(self, path, ignore_errors=False):
+        return self._concrete_storage_manager.rmtree(path, ignore_errors=ignore_errors)
+
     def open(self, name, mode='rb'):
         return self._concrete_storage_manager.open(name, mode=mode)
 
@@ -130,17 +170,20 @@ class StorageManager(StorageManagerInterface):
 
     def copy_files_list(self, files: List[str]):
         out = []
+        random_suffix = f'{uuid1().hex[:8]}'
         for f in files:
-            try:
-                out.append(self.path(f))
-            except SuspiciousFileOperation:
-                with self.open(f, 'rb+') as open_file:
-                    old_path = str(os.path.basename(Path(f).parent.absolute()))
-                    old_file_name, _ = os.path.splitext(os.path.basename(f))
-                    _, ext = os.path.splitext(open_file.name)
-                    path = os.path.join(old_path, f'{uuid1().hex[:8]}')
-                    new_file = f"{path}/{self.generate_filename(old_file_name)}{ext}"
-                    out.append(self.copy_single_file(open_file, new_file))
+            with self.open(f, 'rb+') as open_file:
+                old_path = str(os.path.basename(Path(f).parent.absolute()))
+                old_file_name, _ = os.path.splitext(os.path.basename(f))
+                _, ext = os.path.splitext(open_file.name)
+                # path = os.path.join(old_path, random_suffix)
+                path = old_path
+                if re.match(r'.*_\w{7}$', old_file_name):
+                    suffixed_name = re.sub(r'_\w{7}$', f'_{random_suffix}', old_file_name)
+                    new_file = f"{path}/{suffixed_name}{ext}"
+                else:
+                    new_file = f"{path}/{old_file_name}_{random_suffix}{ext}"
+                out.append(self.copy_single_file(open_file, new_file))
         return out
 
     def copy_single_file(self, old_file: BinaryIO, new_file: str):
@@ -149,17 +192,18 @@ class StorageManager(StorageManagerInterface):
 
     def replace_files_list(self, old_files: List[str], new_files: List[str]):
         out = []
+        random_prefix = f'{uuid1().hex[:8]}'
         if len(old_files) and old_files[0]:
             for f in new_files:
                 with self.open(f, 'rb+') as open_file:
-                    out.append(self.replace_single_file(old_files[0], open_file))
+                    out.append(self.replace_single_file(old_files[0], open_file, prefix=random_prefix))
         return out
 
-    def replace_single_file(self, old_file: str, new_file: BinaryIO):
+    def replace_single_file(self, old_file: str, new_file: BinaryIO, prefix: str = None):
         old_path = str(os.path.basename(Path(old_file).parent.absolute()))
         old_file_name, _ = os.path.splitext(os.path.basename(old_file))
         _, ext = os.path.splitext(new_file.name)
-        path = os.path.join(old_path, f'{uuid1().hex[:8]}')
+        path = os.path.join(old_path, prefix) if prefix else old_path
         try:
             filepath = self.save(f"{path}/{old_file_name}{ext}", new_file)
         except SuspiciousFileOperation:
@@ -190,6 +234,10 @@ class DefaultStorageManager(StorageManagerInterface):
 
     def listdir(self, path):
         return self._fsm.listdir(path)
+
+    def rmtree(self, path, ignore_errors=False):
+        if os.path.exists(path):
+            shutil.rmtree(path, ignore_errors=ignore_errors)
 
     def open(self, name, mode='rb'):
         try:

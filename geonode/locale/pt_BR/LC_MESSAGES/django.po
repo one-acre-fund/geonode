@@ -1901,7 +1901,7 @@ msgid "E-mail"
 msgstr "Email"
 
 #, python-format
-msgid "Invitations succefully sent to '%(email)s'"
+msgid "Invitations successfully sent to '%(email)s'"
 msgstr "Convite enviado com sucesso para ‘%(email)s’"
 
 #, python-format
@@ -6586,13 +6586,6 @@ msgid ""
 msgstr ""
 "O tamanho do arquivo excede {filesizeformat(max_size)}. Tente novamente com "
 "um arquivo menor."
-
-msgid ""
-"To avoid errors, max size should be at least 2 times "
-"greater than the value of others size limits."
-msgstr ""
-"Para evitar erros, o tamanho máximo deve ser pelo menos 2 vezes maior que o "
-"valor de outros limites de tamanho."
 
 msgid ""
 "To avoid errors, max size should be at least 2 times "

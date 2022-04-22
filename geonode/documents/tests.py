@@ -58,6 +58,7 @@ from geonode.base.populate_test_data import (
     all_public,
     create_models,
     remove_models)
+from geonode.upload.api.exceptions import FileUploadLimitException
 
 from .forms import DocumentCreateForm
 
@@ -278,14 +279,16 @@ class DocumentsTest(GeoNodeBaseTestSupport):
         test_file.size = settings.DEFAULT_MAX_UPLOAD_SIZE * 5  # Set as a large file
 
         file_data = {'doc_file': test_file}
-        form = DocumentCreateForm(form_data, file_data)
 
-        self.assertFalse(form.is_valid())
-        expected_error = (
-            f"File size size exceeds {filesizeformat(settings.DEFAULT_MAX_UPLOAD_SIZE)}. "
-            f"Please try again with a smaller file."
-        )
-        self.assertEqual(form.errors, {'doc_file': [expected_error]})
+        with self.assertRaises(FileUploadLimitException):
+            form = DocumentCreateForm(form_data, file_data)
+
+            self.assertFalse(form.is_valid())
+            expected_error = (
+                f"File size size exceeds {filesizeformat(settings.DEFAULT_MAX_UPLOAD_SIZE)}. "
+                f"Please try again with a smaller file."
+            )
+            self.assertEqual(form.errors, {'doc_file': [expected_error]})
 
     def test_document_embed(self):
         """/documents/1 -> Test accessing the embed view of a document"""
@@ -301,7 +304,7 @@ class DocumentsTest(GeoNodeBaseTestSupport):
         log = self.client.login(username='bobby', password='bob')
         self.assertTrue(log)
         response = self.client.get(reverse('document_upload'))
-        self.assertTrue('Upload Documents' in ensure_string(response.content))
+        self.assertEqual(response.status_code, 405)
 
     def test_document_isuploaded(self):
         """/documents/upload -> Test uploading a document"""
@@ -314,14 +317,14 @@ class DocumentsTest(GeoNodeBaseTestSupport):
 
         self.client.login(username='admin', password='admin')
         response = self.client.post(
-            reverse('document_upload'),
+            f"{reverse('document_upload')}?no__redirect=true",
             data={
-                'file': f,
+                'doc_file': f,
                 'title': 'uploaded_document',
                 'q': m.id,
-                'type': 'map',
+                'type': 'document',
                 'permissions': '{"users":{"AnonymousUser": ["view_resourcebase"]}}'},
-            follow=True)
+        )
         self.assertEqual(response.status_code, 200)
 
     # Permissions Tests

@@ -28,6 +28,7 @@ from urllib.parse import urlparse, urljoin
 from django.urls import reverse
 from django.conf import settings
 from django.utils import timezone
+from django.core.exceptions import FieldDoesNotExist
 from django.utils.translation import ugettext_lazy as _
 from django.contrib.gis.geos import (
     GEOSGeometry,
@@ -55,9 +56,6 @@ from ..documents.enumerations import (
 from ..people.utils import get_valid_user
 from ..layers.utils import resolve_regions
 from ..layers.metadata import convert_keyword
-
-from ..services.models import Service
-from ..harvesting.models import HarvestableResource
 
 logger = logging.getLogger(__name__)
 
@@ -124,19 +122,16 @@ class KeywordHandler:
 
     def _set_free_keyword(self, keywords):
         if len(keywords) > 0:
-            if not self.instance.keywords:
-                self.instance.keywords = keywords
-            else:
+            if self.instance.keywords.exists():
                 self.instance.keywords.clear()
-                self.instance.keywords.add(*keywords)
+            self.instance.keywords.add(*keywords)
         return keywords
 
     def _set_tkeyword(self, tkeyword):
         if len(tkeyword) > 0:
-            if not self.instance.tkeywords:
-                self.instance.tkeywords = tkeyword
-            else:
-                self.instance.tkeywords.add(*tkeyword)
+            if self.instance.tkeywords.exists():
+                self.instance.tkeywords.clear()
+            self.instance.tkeywords.add(*tkeyword)
         return [t.alt_label for t in tkeyword]
 
 
@@ -185,23 +180,32 @@ def update_resource(instance: ResourceBase, xml_file: str = None, regions: list 
     poc = defaults.pop('poc', None)
     metadata_author = defaults.pop('metadata_author', None)
 
-    # Save all the modified information in the instance without triggering signals.
-    if hasattr(instance, 'title') and not defaults.get('title', instance.title):
-        defaults['title'] = instance.title or getattr(instance, 'name', "")
-    if hasattr(instance, 'abstract') and not defaults.get('abstract', instance.abstract):
-        defaults['abstract'] = instance.abstract or ''
-    if hasattr(instance, 'date') and not defaults.get('date'):
-        defaults['date'] = instance.date or timezone.now()
-
     to_update = {}
     for _key in ('name', ):
-        if hasattr(instance, _key):
+        try:
+            instance._meta.get_field(_key)
             if _key in defaults:
                 to_update[_key] = defaults.pop(_key)
             else:
                 to_update[_key] = getattr(instance, _key)
-        elif _key in defaults:
-            defaults.pop(_key)
+        except FieldDoesNotExist:
+            if _key in defaults:
+                defaults.pop(_key)
+
+    # Save all the modified information in the instance without triggering signals.
+    _default_values = {
+        'date': timezone.now(),
+        'title': getattr(instance, 'name', ''),
+        'abstract': ''
+    }
+    for _key in _default_values.keys():
+        if not defaults.get(_key, None):
+            try:
+                instance._meta.get_field(_key)
+                defaults[_key] = getattr(instance, _key, None) or _default_values.get(_key)
+            except FieldDoesNotExist:
+                if _key in defaults:
+                    defaults.pop(_key)
 
     if isinstance(instance, Dataset):
         for _key in ('workspace', 'store', 'subtype', 'alternate', 'typename'):
@@ -239,12 +243,17 @@ def update_resource(instance: ResourceBase, xml_file: str = None, regions: list 
         ResourceBase.objects.filter(id=instance.resourcebase_ptr.id).update(**defaults)
     except Exception as e:
         logger.error(f"{e} - {defaults}")
+        raise
     try:
         instance.get_real_concrete_instance_class().objects.filter(id=instance.id).update(**to_update)
     except Exception as e:
         logger.error(f"{e} - {to_update}")
+        raise
 
     # Check for "remote services" availability
+    from ..services.models import Service
+    from ..harvesting.models import HarvestableResource
+
     if HarvestableResource.objects.filter(geonode_resource__uuid=instance.uuid).exists():
         _h = HarvestableResource.objects.filter(geonode_resource__uuid=instance.uuid).get().harvester
         if Service.objects.filter(harvester=_h).exists():
@@ -424,7 +433,7 @@ def metadata_post_save(instance, *args, **kwargs):
         instance.owner = get_valid_user()
 
     if not instance.uuid:
-        instance.uuid = str(uuid.uuid1())
+        instance.uuid = str(uuid.uuid4())
 
     # set default License if no specified
     if instance.license is None:
@@ -526,7 +535,7 @@ def resourcebase_post_save(instance, *args, **kwargs):
         if hasattr(instance, 'title') and not getattr(instance, 'title', None) or getattr(instance, 'title', '') == '':
             if isinstance(instance, Document) and instance.files:
                 instance.title = os.path.basename(instance.files[0])
-            elif hasattr(instance, 'name'):
+            if hasattr(instance, 'name') and getattr(instance, 'name', None):
                 instance.title = instance.name
         if hasattr(instance, 'alternate') and not getattr(instance, 'alternate', None) or getattr(instance, 'alternate', '') == '':
             instance.alternate = get_alternate_name(instance)
