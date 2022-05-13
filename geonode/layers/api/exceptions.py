@@ -1,6 +1,6 @@
 #########################################################################
 #
-# Copyright (C) 2017 OSGeo
+# Copyright (C) 2022 OSGeo
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -16,31 +16,18 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 #
 #########################################################################
-
-"""signal handlers for geonode.services"""
-
-import logging
+from rest_framework.exceptions import APIException
 
 
-from django.dispatch import receiver
-from django.db.models import signals
-from geonode.harvesting.models import Harvester
-from .models import Service
-
-logger = logging.getLogger(__name__)
-
-
-@receiver(signals.post_delete, sender=Service)
-def remove_harvesters(instance, **kwargs):
-    """Remove a Service's harvesters and related resources."""
-    try:
-        if instance.harvester:
-            instance.harvester.delete()
-    except Harvester.DoesNotExist as e:
-        logger.warn(e)
+class GeneralDatasetException(APIException):
+    status_code = 500
+    default_detail = "Error during dataset replace."
+    default_code = "dataset_exception"
+    category = "dataset_api"
 
 
-@receiver(signals.post_save, sender=Service)
-def post_save_service(instance, sender, created, **kwargs):
-    if created:
-        instance.set_default_permissions()
+class InvalidDatasetException(APIException):
+    status_code = 500
+    default_detail = "Input payload is not valid"
+    default_code = "invalid_dataset_exception"
+    category = "dataset_api"
